@@ -1,4 +1,4 @@
-name: 🕵️ AI-Powered OSINT & Conviso
+name: 🕵️ Full OSINT & Conviso Integration
 
 on:
   workflow_dispatch:
@@ -16,31 +16,19 @@ on:
         required: true
         type: string
       company_id:
-        description: 'Conviso Company ID (Obrigatório para contexto)'
+        description: 'Conviso Company ID (Contexto)'
         required: true
         type: string
-      scope:
-        description: 'Recon Scope'
-        required: true
-        type: choice
-        options:
-          - passive-only
-          - passive-active-light
-          - full-recon
-        default: passive-active-light
 
 env:
   CONVISO_API_KEY: ${{ secrets.CONVISO_API_KEY }}
-  CONVISO_API_URL: https://api.convisoappsec.com/graphql
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-  SCAN_ID: ${{ github.run_id }}_${{ github.run_number }}
+  SCAN_ID: ${{ github.run_id }}
 
 jobs:
-  # ============================================
-  # JOB 1: Passive Reconnaissance (Mantido do original)
-  # ============================================
+  # 1. RECONHECIMENTO PASSIVO
   passive-recon:
-    name: 🕵️ Passive Recon
+    name: 🕵️ 1. Passive Recon
     runs-on: ubuntu-latest
     outputs:
       target_domain: ${{ steps.extract.outputs.domain }}
@@ -49,75 +37,47 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-      - name: Install Recon Tools
+      - name: Install Tools
         run: |
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go install github.com/lc/gau/v2/cmd/gau@latest
           go install github.com/tomnomnom/waybackurls@latest
           go install github.com/tomnomnom/unfurl@latest
           go install github.com/tomnomnom/anew@latest
-          nuclei -update-templates
+      
       - name: Extract Domain
         id: extract
         run: |
           DOMAIN=$(echo "${{ github.event.inputs.target }}" | unfurl domains | head -1)
           echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
-      - name: Technology & DNS
+
+      - name: Enumeration
         run: |
           mkdir -p passive
-          echo "${{ github.event.inputs.target }}" | httpx -tech-detect -json -o passive/tech.json
-          echo "${{ steps.extract.outputs.domain }}" | dnsx -json -o passive/dns.json
+          # Subdomínios e DNS
           subfinder -d ${{ steps.extract.outputs.domain }} -silent -all -o passive/subdomains.txt
-          cat passive/subdomains.txt | httpx -tls-grab -json -o passive/tls.json
-      - name: Wayback & Params
-        run: |
-          gau --threads 5 --subs ${{ steps.extract.outputs.domain }} > passive/gau.txt
-          echo "${{ steps.extract.outputs.domain }}" | waybackurls >> passive/wayback.txt
-          cat passive/gau.txt passive/wayback.txt | anew passive/all-urls.txt
-          cat passive/all-urls.txt | unfurl keys | sort -u > passive/parameters.txt
+          echo "${{ steps.extract.outputs.domain }}" | dnsx -json -o passive/dns.json
+          
+          # URLs Passivas (Wayback/AlienVault)
+          gau --threads 5 --subs ${{ steps.extract.outputs.domain }} > passive/urls_raw.txt
+          echo "${{ steps.extract.outputs.domain }}" | waybackurls >> passive/urls_raw.txt
+          cat passive/urls_raw.txt | anew passive/all-urls.txt
+          
+          # Extração de Parâmetros e Paths
           cat passive/all-urls.txt | unfurl paths | sort -u > passive/paths.txt
+          
       - uses: actions/upload-artifact@v4
         with:
-          name: passive-recon-results
+          name: passive-results
           path: passive/
 
-  # ============================================
-  # JOB 2: OSINT (Mantido do original)
-  # ============================================
-  osint-dorks:
-    name: 🔎 OSINT & Sensitive Files
+  # 2. RECONHECIMENTO ATIVO (Roda sempre após o passivo)
+  active-recon:
+    name: 🎯 2. Active Recon
     runs-on: ubuntu-latest
     needs: passive-recon
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-      - run: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-      - uses: actions/download-artifact@v4
-        with:
-          name: passive-recon-results
-          path: passive/
-      - name: Nuclei OSINT Scan
-        run: |
-          mkdir -p osint
-          nuclei -u ${{ github.event.inputs.target }} -tags panel,login,config,exposure -severity medium,high,critical -json -o osint/nuclei-osint.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: osint-results
-          path: osint/
-
-  # ============================================
-  # JOB 3: Active Recon (Mantido do original)
-  # ============================================
-  active-recon:
-    name: 🎯 Active Recon
-    runs-on: ubuntu-latest
-    needs: [passive-recon]
-    if: github.event.inputs.scope != 'passive-only'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -126,116 +86,119 @@ jobs:
       - run: |
           go install github.com/ffuf/ffuf/v2@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+
       - uses: actions/download-artifact@v4
         with:
-          name: passive-recon-results
+          name: passive-results
           path: passive/
-      - name: Fuzzing & Validation
+
+      - name: Active Probing
         run: |
           mkdir -p active
-          cat passive/paths.txt | head -100 > active/seeds.txt
-          ffuf -u "${{ github.event.inputs.target }}/FUZZ" -w active/seeds.txt -mc 200,403 -rate 10 -json -o active/fuzz.json
+          # Validação de alvos vivos e Tech Detect
+          cat passive/subdomains.txt | httpx -tech-detect -status-code -title -json -o active/live-hosts.json
+          
+          # Fuzzing rápido em diretórios principais (usando paths descobertos como base)
+          head -n 200 passive/paths.txt > active/wordlist.txt
+          ffuf -u "${{ github.event.inputs.target }}/FUZZ" -w active/wordlist.txt -mc 200,403,301 -rate 10 -json -o active/fuzzing.json
+
       - uses: actions/upload-artifact@v4
         with:
-          name: active-recon-results
+          name: active-results
           path: active/
 
-  # ============================================
-  # JOB 4: Vuln Scan (Mantido do original)
-  # ============================================
-  vulnerability-scan:
-    name: 🧬 Nuclei Vuln Scan
+  # 3. SCAN DE VULNERABILIDADES (Focado em Misconfig/Headers/Exposure)
+  vuln-scan:
+    name: 🧬 3. Vuln Scan (Misconfigs)
     runs-on: ubuntu-latest
     needs: active-recon
-    if: github.event.inputs.scope == 'full-recon'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-      - run: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+      - run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          nuclei -update-templates
+
       - uses: actions/download-artifact@v4
-      - name: Full Scan
+        with:
+          name: passive-results
+          path: passive-results/ # Actions baixa criando pasta com nome do artefato
+
+      - name: Nuclei Scan
         run: |
           mkdir -p vulnerabilities
-          cat passive-recon-results/all-urls.txt > targets.txt
-          nuclei -l targets.txt -severity medium,high,critical -exclude-tags dos -rate-limit 50 -json -o vulnerabilities/full.json
+          # Prepara lista de alvos
+          cat passive-results/subdomains.txt > targets.txt
+          echo "${{ github.event.inputs.target }}" >> targets.txt
+          sort -u targets.txt -o targets.txt
+
+          # COMANDO ATUALIZADO: Inclui misconfiguration, config, headers, exposure
+          # Inclui severidade 'low' para pegar headers de segurança faltantes
+          nuclei -l targets.txt \
+            -tags misconfiguration,config,exposure,http-headers,web-server,panel \
+            -severity low,medium,high,critical \
+            -rate-limit 50 \
+            -json \
+            -o vulnerabilities/nuclei.json
+
       - uses: actions/upload-artifact@v4
         with:
-          name: vulnerability-results
+          name: vuln-results
           path: vulnerabilities/
 
-  # ============================================
-  # JOB 5: Process Findings (Mantido do original)
-  # ============================================
-  process-findings:
-    name: 📊 Process Findings
+  # 4. PROCESSAMENTO E IA
+  process-and-ai:
+    name: 🤖 4. Process & AI Analysis
     runs-on: ubuntu-latest
-    needs: [osint-dorks, active-recon]
-    if: always()
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - uses: actions/download-artifact@v4
-      - name: Normalize
-        run: |
-          # Script simples para consolidar JSONs (simplificado do original)
-          python3 scripts/normalize_findings.py "${{ github.event.inputs.target }}"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: normalized-findings
-          path: normalized-findings.json
-
-  # ============================================
-  # JOB 6: AI Analysis (NOVO)
-  # ============================================
-  ai-analysis:
-    name: 🤖 AI Report Generation
-    runs-on: ubuntu-latest
-    needs: process-findings
+    needs: vuln-scan
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - run: pip install requests
+      
       - uses: actions/download-artifact@v4
-        with:
-          name: normalized-findings
-      - name: Generate AI Report
+      
+      - name: Normalize & Analyze
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: python3 scripts/ai_analyzer.py
+        run: |
+          # 1. Normalizar (junta resultados se houver múltiplos)
+          python3 scripts/normalize_findings.py "${{ github.event.inputs.target }}"
+          
+          # 2. Gerar Relatório IA
+          python3 scripts/ai_analyzer.py
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ai-report
-          path: AI_RECON_REPORT.md
+          name: final-artifacts
+          path: |
+            normalized-findings.json
+            AI_RECON_REPORT.md
 
-  # ============================================
-  # JOB 7: Conviso Integration (ATUALIZADO)
-  # ============================================
+  # 5. INTEGRAÇÃO CONVISO
   conviso-integration:
-    name: 📤 Send to Conviso
+    name: 📤 5. Send to Conviso
     runs-on: ubuntu-latest
-    # needs: [process-findings, ai-analysis] # Descomente se usar os jobs anteriores
+    needs: process-and-ai
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - run: pip install requests
+      
       - uses: actions/download-artifact@v4
-      - name: Execute Integration
+        with:
+          name: final-artifacts
+
+      - name: Upload Findings
         env:
           CONVISO_API_KEY: ${{ secrets.CONVISO_API_KEY }}
         run: |
-          # Move arquivos (ajuste conforme nomes dos seus artifacts)
-          mv normalized-findings/normalized-findings.json . || true
-          mv ai-report/AI_RECON_REPORT.md . || true
-          
-          # Passando o Company ID como 4º argumento
           python3 scripts/conviso_integration.py \
             normalized-findings.json \
             "${{ github.event.inputs.project_id }}" \
