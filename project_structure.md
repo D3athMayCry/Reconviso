@@ -52,7 +52,6 @@ Pipeline automatizado de reconhecimento OSINT usando GitHub Actions, integrado c
 
 ### 📤 Integrations
 - ✅ **Conviso Platform** (GraphQL API)
-- ✅ Slack notifications
 - ✅ Discord webhooks (opcional)
 - ✅ GitHub Comments
 
@@ -67,7 +66,6 @@ osint-recon-automation/
 ├── scripts/
 │   ├── conviso_integration.py       # Integração Conviso
 │   ├── normalize_findings.py        # Normalização de dados
-│   └── slack_notifier.py           # Notificações Slack
 │
 ├── wordlists/
 │   ├── common-paths.txt            # Paths comuns
@@ -97,7 +95,6 @@ Configure os seguintes secrets em **Settings > Secrets and variables > Actions**
 
 ```bash
 CONVISO_API_KEY          # API key do Conviso Platform
-SLACK_WEBHOOK_URL        # (Opcional) Webhook do Slack
 DISCORD_WEBHOOK_URL      # (Opcional) Webhook do Discord
 ```
 
@@ -123,9 +120,6 @@ Via GitHub UI ou GitHub CLI:
 ```bash
 gh secret set CONVISO_API_KEY
 # Cole sua API key quando solicitado
-
-gh secret set SLACK_WEBHOOK_URL
-# Cole sua webhook URL quando solicitado
 ```
 
 ### 3. Crie os diretórios necessários
@@ -154,7 +148,6 @@ Crie um arquivo `.env` local (não commitar):
 ```bash
 CONVISO_API_KEY=your_api_key_here
 CONVISO_API_URL=https://api.convisoappsec.com/graphql
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
 ```
 
 ### Ajustar Rate Limits
