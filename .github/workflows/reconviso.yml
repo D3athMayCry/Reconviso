@@ -23,11 +23,6 @@ on:
 
 env:
   SCAN_ID: ${{ github.run_id }}
-  MAX_RATE: ${{ 
-    github.event.inputs.stealth_level == 'ultra' && '3' ||
-    github.event.inputs.stealth_level == 'low' && '5' ||
-    '15'
-  }}
   THREADS: 1
   TIMEOUT: 8
   DELAY: 2
@@ -40,19 +35,31 @@ jobs:
     outputs:
       domain: ${{ steps.extract.outputs.domain }}
       scope: ${{ steps.extract.outputs.scope }}
+      max_rate: ${{ steps.stealth.outputs.max_rate }}
     steps:
       - uses: actions/checkout@v4
       
       - name: Extract Domain & Scope
         id: extract
         run: |
-          Extrai domínio principal
-          DOMAIN=$(echo "${{ env.TARGET_DOMAIN }}" | sed 's|https\?://||' | sed 's|/.*||' | head -1)
+          DOMAIN=$(echo "${{ github.event.inputs.target }}" | sed 's|https\?://||' | sed 's|/.*||' | head -1)
           SCOPE="${{ github.event.inputs.scope || '*.'$DOMAIN','$DOMAIN }}"
-          
           echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
           echo "scope=$SCOPE" >> $GITHUB_OUTPUT
           echo "Target: $DOMAIN | Scope: $SCOPE"
+      
+      - name: Calculate Stealth Rate
+        id: stealth
+        run: |
+          LEVEL="${{ github.event.inputs.stealth_level || 'low' }}"
+          case $LEVEL in
+            "ultra") MAX_RATE=3;;
+            "low") MAX_RATE=5;;
+            "normal") MAX_RATE=15;;
+            *) MAX_RATE=5;;
+          esac
+          echo "max_rate=$MAX_RATE" >> $GITHUB_OUTPUT
+          echo "MAX_RATE=$MAX_RATE" >> $GITHUB_ENV
 
   # 1. RECONHECIMENTO PASSIVO
   passive-recon:
@@ -122,9 +129,8 @@ jobs:
         with:
           go-version: '1.23'
 
-      - name: Install Stealth Tools
-        run: |
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+      - name: Install httpx
+        run: go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 
       - uses: actions/download-artifact@v4
         with:
@@ -132,10 +138,13 @@ jobs:
           path: passive-subdomains/
 
       - name: Stealth HTTP Probing
+        env:
+          MAX_RATE: ${{ needs.setup.outputs.max_rate }}
+          THREADS: 1
+          TIMEOUT: 8
+          DELAY: 2
         run: |
           mkdir -p output/active
-          
-          #STEALTH HTTPX
           cat passive-subdomains/subdomains.txt | head -1000 | httpx \
             -silent \
             -threads $THREADS \
@@ -155,7 +164,7 @@ jobs:
   stealth-vuln:
     name: Stealth Vuln Scan
     runs-on: ubuntu-latest
-    needs: [stealth-active, passive-recon]
+    needs: [stealth-active, passive-recon, setup]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -177,24 +186,24 @@ jobs:
           name: passive-subdomains
           path: passive-subdomains/
 
-      - name: Stealth Nuclei Scan
+      - name: Stealth Nuclei
+        env:
+          MAX_RATE: ${{ needs.setup.outputs.max_rate }}
+          THREADS: 1
+          TIMEOUT: 8
         run: |
           mkdir -p output/vuln
-          
-          # Targets consolidados (apenas live)
           cat passive-subdomains/subdomains.txt > targets.txt
           cat stealth-active/live.json | jq -r '.url' >> targets.txt 2>/dev/null || true
           sort -u targets.txt -o targets.txt
           
-          # NUCLEI STEALTH: SOMENTE CRÍTICO/MÉDIO + HEADERS
           nuclei -l targets.txt \
             -tags misconfiguration,http-headers,cve,file,exposure \
             -severity medium,high,critical \
             -c $THREADS \
             -rl $MAX_RATE \
             -timeout $TIMEOUT \
-            -headless \
-            -silent \
+            -headless -silent \
             -jsonl -o output/vuln/nuclei.jsonl
 
       - uses: actions/upload-artifact@v4
@@ -202,65 +211,35 @@ jobs:
           name: stealth-vuln
           path: output/vuln/
 
-  # 4. REPORT
+  # 4. REPORT FINAL (CORRIGIDO)
   stealth-report:
-    name: Stealth Report
+    name: Final Report
     runs-on: ubuntu-latest
-    needs: [stealth-vuln, passive-recon, stealth-active]
+    needs: [stealth-vuln, passive-recon, stealth-active, setup]
     steps:
-      - name: Download All Stealth Results
+      - name: Download All Results
         uses: actions/download-artifact@v4
         with:
           path: results/
           merge-multiple: true
 
-      - name: Generate Stealth Report
+      - name: Generate Report
         run: |
           mkdir -p stealth-report
           DOMAIN="${{ needs.setup.outputs.domain }}"
           
-          # REPORT MÍNIMO E LIMPO
           cat > stealth-report/STEALTH-RECON.md << EOF
 # STEALTH RECON REPORT
 **Target:** $DOMAIN 
-**Stealth:** ${{ github.event.inputs.stealth_level || 'low' }} 
-**Rate:** $MAX_RATE req/s 
-**Scan:** $SCAN_ID
+**Stealth:** ${{ github.event.inputs.stealth_level }} 
+**Max Rate:** ${{ needs.setup.outputs.max_rate }} req/s
+**Scan ID:** $SCAN_ID
 
-## FINDINGS
-
+## SUMMARY
 EOF
 
-          # Stats silenciosos
-          SUBS=\$(find results/ -name "*subdomains*" -exec cat {} + 2>/dev/null | wc -l)
-          LIVE=\$(cat results/*/live.json 2>/dev/null | jq length 2>/dev/null || echo 0)
-          VULN=\$(cat results/*/nuclei.jsonl 2>/dev/null | wc -l)
+          SUBS=$(find results/ -name "*subdomains*" -exec cat {} + 2>/dev/null | wc -l)
+          LIVE=$(cat results/*/live.json 2>/dev/null | jq length 2>/dev/null || echo 0)
+          VULN=$(cat results/*/nuclei.jsonl 2>/dev/null | wc -l)
           
           cat >> stealth-report/STEALTH-RECON.md << EOF
-**Subdomains:** \$SUBS | **Live:** \$LIVE | **Vulns:** \$VULN
-
-## CRITICAL VULNS
-EOF
-
-          # Top vulns
-          cat results/*/nuclei.jsonl 2>/dev/null | \
-            jq -r '.info.severity + "|" + .info.name + "|" + .info.host' 2>/dev/null | \
-            sort | uniq -c | sort -nr | head -15 >> stealth-report/STEALTH-RECON.md
-
-          # Live hosts
-          echo -e "\n## LIVE HOSTS" >> stealth-report/STEALTH-RECON.md
-          cat results/*/live.json 2>/dev/null | \
-            jq -r 'select(.status_code<400) | "- \$.url) [\$.status_code)] \$.title)"' | \
-            head -20 >> stealth-report/STEALTH-RECON.md
-
-          # Arquivo único
-          tar -czf stealth-report-${DOMAIN}-${SCAN_ID}.tar.gz \
-            stealth-report/ results/ --exclude='*.tar.gz'
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: STEALTH-REPORT-${{ needs.setup.outputs.domain }}
-          path: |
-            stealth-report/
-            stealth-report-*.tar.gz
-          retention-days: 14
