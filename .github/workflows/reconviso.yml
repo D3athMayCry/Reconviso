@@ -23,43 +23,39 @@ on:
 
 env:
   SCAN_ID: ${{ github.run_id }}
-  THREADS: 1
-  TIMEOUT: 8
-  DELAY: 2
 
 jobs:
-  # 0. SETUP & VALIDATION
   setup:
-    name: Setup & Validation
+    name: Setup & Stealth Config
     runs-on: ubuntu-latest
     outputs:
       domain: ${{ steps.extract.outputs.domain }}
       scope: ${{ steps.extract.outputs.scope }}
       max_rate: ${{ steps.stealth.outputs.max_rate }}
     steps:
-      - uses: actions/checkout@v4
-      
       - name: Extract Domain & Scope
         id: extract
         run: |
           DOMAIN=$(echo "${{ github.event.inputs.target }}" | sed 's|https\?://||' | sed 's|/.*||' | head -1)
-          SCOPE="${{ github.event.inputs.scope || '*.'$DOMAIN','$DOMAIN }}"
+          if [ -z "${{ github.event.inputs.scope }}" ]; then
+            SCOPE="*.${DOMAIN},${DOMAIN}"
+          else
+            SCOPE="${{ github.event.inputs.scope }}"
+          fi
           echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
           echo "scope=$SCOPE" >> $GITHUB_OUTPUT
-          echo "Target: $DOMAIN | Scope: $SCOPE"
-      
+
       - name: Calculate Stealth Rate
         id: stealth
         run: |
           LEVEL="${{ github.event.inputs.stealth_level || 'low' }}"
           case $LEVEL in
-            "ultra") MAX_RATE=3;;
-            "low") MAX_RATE=5;;
-            "normal") MAX_RATE=15;;
+            ultra) MAX_RATE=3;;
+            low) MAX_RATE=5;;
+            normal) MAX_RATE=15;;
             *) MAX_RATE=5;;
           esac
           echo "max_rate=$MAX_RATE" >> $GITHUB_OUTPUT
-          echo "MAX_RATE=$MAX_RATE" >> $GITHUB_ENV
 
   # 1. RECONHECIMENTO PASSIVO
   passive-recon:
