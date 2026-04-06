@@ -147,7 +147,7 @@ jobs:
             -rate-limit $MAX_RATE \
             -timeout $TIMEOUT \
             -delay $DELAY \
-            -no-fallback \
+            -p 80,443,8080,8443 \
             -sc -title \
             -json -o output/active/live.json
 
