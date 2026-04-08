@@ -88,7 +88,10 @@ jobs:
           
           case "${{ matrix.type }}" in
             "subdomains")
-              subfinder -d $DOMAIN -silent -t 50 -o output/passive/subdomains.txt
+              subfinder -d $DOMAIN -silent -t 50 -o output/passive/subdomains.txt || true
+              curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' > output/passive/crtsh.txt || true
+              cat output/passive/subfinder.txt output/passive/crtsh.txt | grep -v '@' | sort -u > output/passive/subdomains.txt
+              echo $DOMAIN >> output/passive/subdomains.txt
               sort -u output/passive/subdomains.txt -o output/passive/subdomains.txt
               ;;
             "urls")
@@ -136,18 +139,18 @@ jobs:
       - name: Stealth HTTP Probing
         env:
           MAX_RATE: ${{ needs.setup.outputs.max_rate }}
-          THREADS: 1
-          TIMEOUT: 8
-          DELAY: 2
+          THREADS: 10
+          TIMEOUT: 5
+          DELAY: 1
         run: |
           mkdir -p output/active
-          cat passive-subdomains/subdomains.txt | head -1000 | httpx \
+          head -n 1000 passive-subdomains/subdomains.txt | httpx \
             -silent \
             -threads $THREADS \
             -rate-limit $MAX_RATE \
             -timeout $TIMEOUT \
             -delay $DELAY \
-            -no-fallback \
+            -p 80,443,8080,8443 \
             -sc -title \
             -json -o output/active/live.json
 
@@ -226,16 +229,28 @@ jobs:
           SCAN_ID: ${{ github.run_id }}
         run: |
           mkdir -p stealth-report
-          
+
           # Header usando printf (evita YAML parsing)
           printf "# 🥷 STEALTH RECON REPORT\n**Target:** %s\n**Stealth:** %s\n**Max Rate:** %s req/s\n**Scan ID:** %s\n\n## 📊 SUMMARY\n" \
             "$DOMAIN" "$STEALTH_LEVEL" "$MAX_RATE" "$SCAN_ID" > stealth-report/STEALTH-RECON.md
           
           # Stats
           SUBS=$(find results/ -name "*subdomains*" -exec cat {} + 2>/dev/null | wc -l 2>/dev/null || echo 0)
-          LIVE=$(cat results/*/live.json 2>/dev/null | jq length 2>/dev/null || echo 0)
+          # Correção para leitura segura do JSONL do httpx
+          LIVE=$(cat results/*/live.json 2>/dev/null | wc -l 2>/dev/null || echo 0)
           VULN=$(cat results/*/nuclei.jsonl 2>/dev/null | wc -l 2>/dev/null || echo 0)
           
-          # Table
-          cat >> stealth-report/STEALTH-RECON.md << 'TABLE_EOF'
+          cat >> stealth-report/STEALTH-RECON.md << TABLE_EOF
+          | Metric | Count |
+          | :--- | :--- |
+          | 🌐 Subdomains Found | $SUBS |
+          | 🟢 Live Hosts | $LIVE |
+          | 🚨 Vulnerabilities | $VULN |
+          TABLE_EOF
+
+      - name: Upload Final Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: Final-Stealth-Report
+          path: stealth-report/
 
