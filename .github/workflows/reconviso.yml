@@ -1,206 +1,255 @@
-name: 🕵️ Full OSINT & Conviso Integration
+name: Recon and OSINT from Main Domain
 
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Target URL (ex: https://example.com)'
+        description: 'Target Domain'
         required: true
         type: string
-      project_id:
-        description: 'Conviso Project ID'
-        required: true
-        type: string
-      asset_id:
-        description: 'Conviso Asset ID'
-        required: true
-        type: string
-      company_id:
-        description: 'Conviso Company ID (Contexto)'
-        required: true
-        type: string
+      scope:
+        description: 'Scope (ex: *.example.com,example.com)'
+        required: false
+        default: ''
+      stealth_level:
+        description: 'Stealth Level'
+        required: false
+        type: choice
+        options:
+          - ultra
+          - low
+          - normal
+        default: low
 
 env:
-  CONVISO_API_KEY: ${{ secrets.CONVISO_API_KEY }}
-  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   SCAN_ID: ${{ github.run_id }}
 
 jobs:
-  # 1. RECONHECIMENTO PASSIVO
-  passive-recon:
-    name: 🕵️ 1. Passive Recon
+  setup:
+    name: Setup & Stealth Config
     runs-on: ubuntu-latest
     outputs:
-      target_domain: ${{ steps.extract.outputs.domain }}
+      domain: ${{ steps.extract.outputs.domain }}
+      scope: ${{ steps.extract.outputs.scope }}
+      max_rate: ${{ steps.stealth.outputs.max_rate }}
+    steps:
+      - name: Extract Domain & Scope
+        id: extract
+        run: |
+          DOMAIN=$(echo "${{ github.event.inputs.target }}" | sed 's|https\?://||' | sed 's|/.*||' | head -1)
+          if [ -z "${{ github.event.inputs.scope }}" ]; then
+            SCOPE="*.${DOMAIN},${DOMAIN}"
+          else
+            SCOPE="${{ github.event.inputs.scope }}"
+          fi
+          echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
+          echo "scope=$SCOPE" >> $GITHUB_OUTPUT
+
+      - name: Calculate Stealth Rate
+        id: stealth
+        run: |
+          LEVEL="${{ github.event.inputs.stealth_level || 'low' }}"
+          case $LEVEL in
+            ultra) MAX_RATE=3;;
+            low) MAX_RATE=5;;
+            normal) MAX_RATE=15;;
+            *) MAX_RATE=5;;
+          esac
+          echo "max_rate=$MAX_RATE" >> $GITHUB_OUTPUT
+
+  # 1. RECONHECIMENTO PASSIVO
+  passive-recon:
+    name: Passive - ${{ matrix.type }}
+    runs-on: ubuntu-latest
+    needs: setup
+    strategy:
+      matrix:
+        type: [subdomains, urls, dns, certs]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
-      - name: Install Tools
+          go-version: '1.23'
+
+      - name: Install Passive Tools
         run: |
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go install github.com/lc/gau/v2/cmd/gau@latest
           go install github.com/tomnomnom/waybackurls@latest
           go install github.com/tomnomnom/unfurl@latest
           go install github.com/tomnomnom/anew@latest
-      
-      - name: Extract Domain
-        id: extract
-        run: |
-          DOMAIN=$(echo "${{ github.event.inputs.target }}" | unfurl domains | head -1)
-          echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
+          go install software.sslmate.com/src/certspotter/cmd/certspotter@latest
 
-      - name: Enumeration
+      - name: Passive Recon
         run: |
-          mkdir -p passive
-          # Subdomínios e DNS
-          subfinder -d ${{ steps.extract.outputs.domain }} -silent -all -o passive/subdomains.txt
-          echo "${{ steps.extract.outputs.domain }}" | dnsx -json -o passive/dns.json
+          mkdir -p output/passive
+          DOMAIN="${{ needs.setup.outputs.domain }}"
           
-          # URLs Passivas (Wayback/AlienVault)
-          gau --threads 5 --subs ${{ steps.extract.outputs.domain }} > passive/urls_raw.txt
-          echo "${{ steps.extract.outputs.domain }}" | waybackurls >> passive/urls_raw.txt
-          cat passive/urls_raw.txt | anew passive/all-urls.txt
-          
-          # Extração de Parâmetros e Paths
-          cat passive/all-urls.txt | unfurl paths | sort -u > passive/paths.txt
-          
+          case "${{ matrix.type }}" in
+            "subdomains")
+              subfinder -d $DOMAIN -silent -t 50 -o output/passive/subdomains.txt || true
+              curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' > output/passive/crtsh.txt || true
+              cat output/passive/subfinder.txt output/passive/crtsh.txt | grep -v '@' | sort -u > output/passive/subdomains.txt
+              echo $DOMAIN >> output/passive/subdomains.txt
+              sort -u output/passive/subdomains.txt -o output/passive/subdomains.txt
+              ;;
+            "urls")
+              gau --threads 5 --subs $DOMAIN > output/passive/urls.txt
+              echo $DOMAIN | waybackurls >> output/passive/urls.txt
+              cat output/passive/urls.txt | sort -u | \
+                grep -E '\.(txt|xml|json|bak|old|backup|config)' > output/passive/urls_juicy.txt
+              cat output/passive/urls.txt | unfurl paths | sort -u > output/passive/paths.txt
+              cat output/passive/urls.txt | unfurl keys | sort -u > output/passive/params.txt
+              ;;
+            "dns")
+              echo $DOMAIN | dnsx -silent -json -o output/passive/dns.json
+              jq -r '.host' output/passive/dns.json | sort -u > output/passive/all-hosts.txt
+              ;;
+            "certs")
+              certspotter -scope "${{ needs.setup.outputs.scope }}" | \
+                grep -i "${{ needs.setup.outputs.domain }}" | sort -u > output/passive/certs.txt
+              ;;
+          esac
+
       - uses: actions/upload-artifact@v4
         with:
-          name: passive-results
-          path: passive/
+          name: passive-${{ matrix.type }}
+          path: output/passive/
 
-  # 2. RECONHECIMENTO ATIVO (Roda sempre após o passivo)
-  active-recon:
-    name: 🎯 2. Active Recon
+  # 2. RECONHECIMENTO ATIVO
+  stealth-active:
+    name: Stealth Active
     runs-on: ubuntu-latest
-    needs: passive-recon
+    needs: [setup, passive-recon]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
-      - run: |
-          go install github.com/ffuf/ffuf/v2@latest
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go-version: '1.23'
+
+      - name: Install httpx
+        run: go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 
       - uses: actions/download-artifact@v4
         with:
-          name: passive-results
-          path: passive/
+          name: passive-subdomains
+          path: passive-subdomains/
 
-      - name: Active Probing
+      - name: Stealth HTTP Probing
+        env:
+          MAX_RATE: ${{ needs.setup.outputs.max_rate }}
+          THREADS: 10
+          TIMEOUT: 5
+          DELAY: 1
         run: |
-          mkdir -p active
-          # Validação de alvos vivos e Tech Detect
-          cat passive/subdomains.txt | httpx -tech-detect -status-code -title -json -o active/live-hosts.json
-          
-          # Fuzzing rápido em diretórios principais (usando paths descobertos como base)
-          head -n 200 passive/paths.txt > active/wordlist.txt
-          ffuf -u "${{ github.event.inputs.target }}/FUZZ" -w active/wordlist.txt -mc 200,403,301 -rate 10 -json -o active/fuzzing.json
+          mkdir -p output/active
+          head -n 1000 passive-subdomains/subdomains.txt | httpx \
+            -silent \
+            -threads $THREADS \
+            -rate-limit $MAX_RATE \
+            -timeout $TIMEOUT \
+            -delay $DELAY \
+            -p 80,443,8080,8443 \
+            -sc -title \
+            -json -o output/active/live.json
 
       - uses: actions/upload-artifact@v4
         with:
-          name: active-results
-          path: active/
+          name: stealth-active
+          path: output/active/
 
-  # 3. SCAN DE VULNERABILIDADES (Focado em Misconfig/Headers/Exposure)
-  vuln-scan:
-    name: 🧬 3. Vuln Scan (Misconfigs)
+  # 3. STEALTH VULN SCAN (CRÍTICO SOMENTE)
+  stealth-vuln:
+    name: Stealth Vuln Scan
     runs-on: ubuntu-latest
-    needs: active-recon
+    needs: [stealth-active, passive-recon, setup]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
-      - run: |
+          go-version: '1.23'
+
+      - name: Setup Nuclei
+        run: |
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           nuclei -update-templates
 
       - uses: actions/download-artifact@v4
         with:
-          name: passive-results
-          path: passive-results/ # Actions baixa criando pasta com nome do artefato
+          name: stealth-active
+          path: stealth-active/
 
-      - name: Nuclei Scan
+      - uses: actions/download-artifact@v4
+        with:
+          name: passive-subdomains
+          path: passive-subdomains/
+
+      - name: Stealth Nuclei
+        env:
+          MAX_RATE: ${{ needs.setup.outputs.max_rate }}
+          THREADS: 1
+          TIMEOUT: 8
         run: |
-          mkdir -p vulnerabilities
-          # Prepara lista de alvos
-          cat passive-results/subdomains.txt > targets.txt
-          echo "${{ github.event.inputs.target }}" >> targets.txt
+          mkdir -p output/vuln
+          cat passive-subdomains/subdomains.txt > targets.txt
+          cat stealth-active/live.json | jq -r '.url' >> targets.txt 2>/dev/null || true
           sort -u targets.txt -o targets.txt
-
-          # COMANDO ATUALIZADO: Inclui misconfiguration, config, headers, exposure
-          # Inclui severidade 'low' para pegar headers de segurança faltantes
-          nuclei -l targets.txt \
-            -tags misconfiguration,config,exposure,http-headers,web-server,panel \
-            -severity low,medium,high,critical \
-            -rate-limit 50 \
-            -json \
-            -o vulnerabilities/nuclei.json
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: vuln-results
-          path: vulnerabilities/
-
-  # 4. PROCESSAMENTO E IA
-  process-and-ai:
-    name: 🤖 4. Process & AI Analysis
-    runs-on: ubuntu-latest
-    needs: vuln-scan
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install requests
-      
-      - uses: actions/download-artifact@v4
-      
-      - name: Normalize & Analyze
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          # 1. Normalizar (junta resultados se houver múltiplos)
-          python3 scripts/normalize_findings.py "${{ github.event.inputs.target }}"
           
-          # 2. Gerar Relatório IA
-          python3 scripts/ai_analyzer.py
+          nuclei -l targets.txt \
+            -tags misconfiguration,http-headers,cve,file,exposure \
+            -severity medium,high,critical \
+            -c $THREADS \
+            -rl $MAX_RATE \
+            -timeout $TIMEOUT \
+            -headless -silent \
+            -jsonl -o output/vuln/nuclei.jsonl
 
       - uses: actions/upload-artifact@v4
         with:
-          name: final-artifacts
-          path: |
-            normalized-findings.json
-            AI_RECON_REPORT.md
+          name: stealth-vuln
+          path: output/vuln/
 
-  # 5. INTEGRAÇÃO CONVISO
-  conviso-integration:
-    name: 📤 5. Send to Conviso
+  stealth-report:
+    name: Final Report
     runs-on: ubuntu-latest
-    needs: process-and-ai
+    needs: [stealth-vuln, passive-recon, stealth-active, setup]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Download All Results
+        uses: actions/download-artifact@v4
         with:
-          python-version: '3.11'
-      - run: pip install requests
-      
-      - uses: actions/download-artifact@v4
-        with:
-          name: final-artifacts
+          path: results/
+          merge-multiple: true
 
-      - name: Upload Findings
+      - name: Generate Report
         env:
-          CONVISO_API_KEY: ${{ secrets.CONVISO_API_KEY }}
+          DOMAIN: ${{ needs.setup.outputs.domain }}
+          STEALTH_LEVEL: ${{ github.event.inputs.stealth_level }}
+          MAX_RATE: ${{ needs.setup.outputs.max_rate }}
+          SCAN_ID: ${{ github.run_id }}
         run: |
-          python3 scripts/conviso_integration.py \
-            normalized-findings.json \
-            "${{ github.event.inputs.project_id }}" \
-            "${{ github.event.inputs.asset_id }}" \
-            "${{ github.event.inputs.company_id }}"
+          mkdir -p stealth-report
+
+          # Header usando printf (evita YAML parsing)
+          printf "# 🥷 STEALTH RECON REPORT\n**Target:** %s\n**Stealth:** %s\n**Max Rate:** %s req/s\n**Scan ID:** %s\n\n## 📊 SUMMARY\n" \
+            "$DOMAIN" "$STEALTH_LEVEL" "$MAX_RATE" "$SCAN_ID" > stealth-report/STEALTH-RECON.md
+          
+          # Stats
+          SUBS=$(find results/ -name "*subdomains*" -exec cat {} + 2>/dev/null | wc -l 2>/dev/null || echo 0)
+          # Correção para leitura segura do JSONL do httpx
+          LIVE=$(cat results/*/live.json 2>/dev/null | wc -l 2>/dev/null || echo 0)
+          VULN=$(cat results/*/nuclei.jsonl 2>/dev/null | wc -l 2>/dev/null || echo 0)
+          
+          cat >> stealth-report/STEALTH-RECON.md << TABLE_EOF
+          | Metric | Count |
+          | :--- | :--- |
+          | 🌐 Subdomains Found | $SUBS |
+          | 🟢 Live Hosts | $LIVE |
+          | 🚨 Vulnerabilities | $VULN |
+          TABLE_EOF
+
+      - name: Upload Final Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: Final-Stealth-Report
+          path: stealth-report/
