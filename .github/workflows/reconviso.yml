@@ -1,312 +1,1876 @@
-name: Recon and OSINT from Main Domain
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║          🥷 ADVANCED OSINT & RECON FRAMEWORK — AI-Powered               ║
+# ║                                                                          ║
+# ║  SECRETS NECESSÁRIOS (Settings → Secrets → Actions):                    ║
+# ║    GEMINI_API_KEY       → aistudio.google.com/app/apikey                ║
+# ║    SHODAN_API_KEY       → account.shodan.io (opcional, grátis limitado) ║
+# ║    SECURITYTRAILS_KEY   → securitytrails.com (opcional)                 ║
+# ║    GITHUB_TOKEN         → injetado automaticamente                       ║
+# ║                                                                          ║
+# ║  FASES:                                                                  ║
+# ║    1 → Passive Recon   (subfinder, dnsx, SSL/TLS, Wayback)              ║
+# ║    2 → OSINT Analysis  (Dorks, emails, params, Shodan)                  ║
+# ║    3 → Active Recon    (httpx, ffuf, form detection, JS analysis)       ║
+# ║    4 → Vuln Scan       (Nuclei + custom templates)                      ║
+# ║    5 → Data Processing (normalize, dedup, classify, enrich)             ║
+# ║    6 → AI Report       (Gemini correlação + attack chains)              ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+name: 🥷 Advanced OSINT & Recon — AI Report
 
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Target Domain'
+        description: '🎯 Target Domain (ex: example.com)'
         required: true
         type: string
       scope:
-        description: 'Scope (ex: *.example.com,example.com)'
+        description: '📐 Scope (ex: *.example.com,example.com | vazio = auto)'
         required: false
         default: ''
       stealth_level:
-        description: 'Stealth Level'
+        description: '🔇 Stealth Level'
         required: false
         type: choice
         options:
-          - ultra
-          - low
-          - normal
+          - ultra   # 3 req/s — máximo furtivo, lento
+          - low     # 5 req/s — discreto (recomendado)
+          - normal  # 15 req/s — balanceado
         default: low
-      nuclei_severities:
-        description: 'Nuclei Severities (comma-separated)'
-        required: false
-        default: 'info,low,medium,high,critical'
-        type: string
       scan_mode:
-        description: 'Scan Mode (Noise Filter)'
+        description: '🔬 Scan Mode'
         required: true
         type: choice
         options:
-          - 'Discovery (Rápido: Apenas arquivos expostos e configs)'
-          - 'Targeted (Inteligente: Adapta os testes à tecnologia do alvo)'
-          - 'Full-Aggressive (Lento: Roda todos os milhares de templates)'
-        default: Targeted
-      max_targets:
-        description: 'Max Subdomains to Scan (Limit to avoid long runs)'
+          - 'Discovery  — Rápido: só exposições e configs'
+          - 'Targeted   — Inteligente: adapta à tecnologia'
+          - 'Aggressive — Completo: todos os templates'
+        default: 'Targeted   — Inteligente: adapta à tecnologia'
+      nuclei_severities:
+        description: '🚨 Nuclei Severities (comma-separated)'
         required: false
-        default: '1000'
+        default: 'low,medium,high,critical'
         type: string
+      max_targets:
+        description: '🔢 Max Subdomains to Scan'
+        required: false
+        default: '500'
+        type: string
+      enable_dorks:
+        description: '🎣 Habilitar Google/GitHub Dorks?'
+        type: boolean
+        default: true
+      enable_portscan:
+        description: '🔌 Habilitar Port Scan rápido?'
+        type: boolean
+        default: true
+      enable_screenshots:
+        description: '📸 Habilitar Screenshots?'
+        type: boolean
+        default: false
 
 env:
   SCAN_ID: ${{ github.run_id }}
+  GO_VERSION: '1.23'
 
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 0 ── SETUP
+# ══════════════════════════════════════════════════════════════════════════════
 jobs:
   setup:
-    name: Setup & Stealth Config
+    name: ⚙️ Setup & Config
     runs-on: ubuntu-latest
     outputs:
-      domain: ${{ steps.extract.outputs.domain }}
-      scope: ${{ steps.extract.outputs.scope }}
-      max_rate: ${{ steps.stealth.outputs.max_rate }}
+      domain:    ${{ steps.extract.outputs.domain }}
+      scope:     ${{ steps.extract.outputs.scope }}
+      max_rate:  ${{ steps.stealth.outputs.max_rate }}
+      threads:   ${{ steps.stealth.outputs.threads }}
+      main_ip:   ${{ steps.meta.outputs.main_ip }}
+      asn:       ${{ steps.meta.outputs.asn }}
+      org:       ${{ steps.meta.outputs.org }}
+      registrar: ${{ steps.meta.outputs.registrar }}
+      tech_hint: ${{ steps.meta.outputs.tech_hint }}
+
     steps:
       - name: Extract Domain & Scope
         id: extract
         run: |
-          DOMAIN=$(echo "${{ github.event.inputs.target }}" | sed 's|https\?://||' | sed 's|/.*||' | head -1)
-          if [ -z "${{ github.event.inputs.scope }}" ]; then
-            SCOPE="*.${DOMAIN},${DOMAIN}"
-          else
-            SCOPE="${{ github.event.inputs.scope }}"
-          fi
+          DOMAIN=$(echo "${{ github.event.inputs.target }}" \
+            | sed 's|https\?://||;s|/.*||' | tr '[:upper:]' '[:lower:]' | xargs)
+          SCOPE="${{ github.event.inputs.scope }}"
+          [ -z "$SCOPE" ] && SCOPE="*.${DOMAIN},${DOMAIN}"
           echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
-          echo "scope=$SCOPE" >> $GITHUB_OUTPUT
+          echo "scope=$SCOPE"   >> $GITHUB_OUTPUT
+          echo "✅ Domain → $DOMAIN | Scope → $SCOPE"
 
-      - name: Calculate Stealth Rate
+      - name: Stealth Profile
         id: stealth
         run: |
-          LEVEL="${{ github.event.inputs.stealth_level || 'low' }}"
-          case $LEVEL in
-            ultra) MAX_RATE=3;;
-            low) MAX_RATE=5;;
-            normal) MAX_RATE=15;;
-            *) MAX_RATE=5;;
+          case "${{ github.event.inputs.stealth_level }}" in
+            ultra)  MAX_RATE=3;  THREADS=5  ;;
+            low)    MAX_RATE=5;  THREADS=10 ;;
+            normal) MAX_RATE=15; THREADS=25 ;;
+            *)      MAX_RATE=5;  THREADS=10 ;;
           esac
           echo "max_rate=$MAX_RATE" >> $GITHUB_OUTPUT
+          echo "threads=$THREADS"   >> $GITHUB_OUTPUT
 
-  # 1. RECONHECIMENTO PASSIVO
-  passive-recon:
-    name: Passive - ${{ matrix.type }}
+      - name: Collect ASN / WHOIS / Tech Metadata
+        id: meta
+        run: |
+          DOMAIN="${{ steps.extract.outputs.domain }}"
+          MAIN_IP=$(dig +short "$DOMAIN" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1 || echo "unknown")
+          ASN=$(curl -s "https://api.hackertarget.com/aslookup/?q=$MAIN_IP" 2>/dev/null \
+                | grep -oP 'AS\d+' | head -1 || echo "unknown")
+          ORG=$(whois "$DOMAIN" 2>/dev/null \
+                | grep -iE '^(org|organisation|registrant org)' \
+                | head -1 | cut -d: -f2- | xargs || echo "unknown")
+          REG=$(whois "$DOMAIN" 2>/dev/null \
+                | grep -i 'registrar:' | head -1 | cut -d: -f2- | xargs || echo "unknown")
+          TECH=$(curl -sk -o /dev/null -D - "https://$DOMAIN" 2>/dev/null \
+                 | grep -i '^server:' | cut -d: -f2- | xargs || echo "unknown")
+          echo "main_ip=$MAIN_IP"   >> $GITHUB_OUTPUT
+          echo "asn=$ASN"           >> $GITHUB_OUTPUT
+          echo "org=$ORG"           >> $GITHUB_OUTPUT
+          echo "registrar=$REG"     >> $GITHUB_OUTPUT
+          echo "tech_hint=$TECH"    >> $GITHUB_OUTPUT
+          echo "🌐 IP=$MAIN_IP | ASN=$ASN | Server=$TECH"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FASE 1 ── PASSIVE RECON (paralelo por matrix)
+# Tech Detection + DNS Enum + SSL/TLS Analysis + Wayback Machine
+# ══════════════════════════════════════════════════════════════════════════════
+  phase1-passive:
+    name: "🔍 Phase1 — ${{ matrix.type }}"
     runs-on: ubuntu-latest
     needs: setup
     strategy:
+      fail-fast: false
       matrix:
-        type: [subdomains, urls, dns, certs]
+        type: [subdomains, dns-ssl, wayback, tech-detection]
+
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
 
-      - name: Install Passive Tools
+      - name: Install Tools
         run: |
-          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-          go install github.com/lc/gau/v2/cmd/gau@latest
-          go install github.com/tomnomnom/waybackurls@latest
-          go install github.com/tomnomnom/unfurl@latest
-          go install github.com/tomnomnom/anew@latest
-          go install github.com/glebarez/cero@latest
-
-      - name: Passive Recon
-        run: |
-          mkdir -p output/passive
-          DOMAIN="${{ needs.setup.outputs.domain }}"
-          
           case "${{ matrix.type }}" in
             "subdomains")
-              subfinder -d $DOMAIN -silent -t 50 -o output/passive/subdomains.txt || true
-              curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' > output/passive/crtsh.txt || true
-              cat output/passive/subfinder.txt output/passive/crtsh.txt | grep -v '@' | sort -u > output/passive/subdomains.txt
-              echo $DOMAIN >> output/passive/subdomains.txt
-              sort -u output/passive/subdomains.txt -o output/passive/subdomains.txt
+              go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest &
+              go install github.com/glebarez/cero@latest &
+              wait ;;
+            "dns-ssl")
+              go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest &
+              go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest &
+              wait ;;
+            "wayback")
+              go install github.com/lc/gau/v2/cmd/gau@latest &
+              go install github.com/tomnomnom/waybackurls@latest &
+              go install github.com/tomnomnom/unfurl@latest &
+              wait ;;
+            "tech-detection")
+              go install github.com/projectdiscovery/httpx/cmd/httpx@latest ;;
+          esac
+
+      - name: Run — ${{ matrix.type }}
+        env:
+          DOMAIN: ${{ needs.setup.outputs.domain }}
+          MAIN_IP: ${{ needs.setup.outputs.main_ip }}
+        run: |
+          mkdir -p output
+
+          case "${{ matrix.type }}" in
+
+            # ──────────────────────────────────────────────────────────────
+            # SUBDOMAIN ENUMERATION
+            # subfinder + crt.sh + RapidDNS + BufferOver + cero
+            # ──────────────────────────────────────────────────────────────
+            "subdomains")
+              echo "=== subfinder ==="
+              subfinder -d "$DOMAIN" -silent -t 50 -all \
+                -o output/subfinder.txt 2>/dev/null || true
+
+              echo "=== crt.sh ==="
+              curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" \
+                | jq -r '.[].name_value' 2>/dev/null \
+                | sed 's/\*\.//g' | sort -u > output/crtsh.txt || true
+
+              echo "=== RapidDNS ==="
+              curl -s "https://rapiddns.io/subdomain/$DOMAIN?full=1" 2>/dev/null \
+                | grep -oP '(?<=<td>)[a-z0-9._-]+\.'$DOMAIN'(?=</td>)' \
+                | sort -u > output/rapiddns.txt || true
+
+              echo "=== BufferOver ==="
+              curl -s "https://dns.bufferover.run/dns?q=.$DOMAIN" 2>/dev/null \
+                | jq -r '.FDNS_A[],.RDNS[]' 2>/dev/null \
+                | cut -d',' -f2 | grep -F ".$DOMAIN" \
+                | sort -u > output/bufferover.txt || true
+
+              echo "=== cero (cert SANs) ==="
+              cero "$DOMAIN" 2>/dev/null | sort -u > output/cero.txt || true
+
+              echo "=== Merge & deduplicate ==="
+              cat output/subfinder.txt output/crtsh.txt output/rapiddns.txt \
+                  output/bufferover.txt output/cero.txt 2>/dev/null \
+                | grep -vE '@|^\s*$' | sort -u > output/subdomains.txt
+              echo "$DOMAIN" >> output/subdomains.txt
+              sort -u -o output/subdomains.txt output/subdomains.txt
+              echo "📦 $(wc -l < output/subdomains.txt) subdomains"
               ;;
-            "urls")
-              gau --threads 5 --subs $DOMAIN > output/passive/urls.txt || true
-              echo $DOMAIN | waybackurls >> output/passive/urls.txt || true
-              cat output/passive/urls.txt | sort -u | \
-                grep -E '\.(txt|xml|json|bak|old|backup|config|env)' > output/passive/urls_juicy.txt || true
-              cat output/passive/urls.txt | unfurl paths | sort -u > output/passive/paths.txt || true
-              cat output/passive/urls.txt | unfurl keys | sort -u > output/passive/params.txt || true
+
+            # ──────────────────────────────────────────────────────────────
+            # DNS ENUMERATION + SSL/TLS ANALYSIS
+            # dnsx (A,MX,TXT,NS,CNAME,SOA) + zone transfer + SPF/DMARC/DKIM
+            # tlsx para cert fingerprint + wildcards
+            # ──────────────────────────────────────────────────────────────
+            "dns-ssl")
+              echo "=== DNS full enumeration ==="
+              echo "$DOMAIN" | dnsx -silent -json \
+                -a -aaaa -cname -mx -txt -ns -soa -ptr \
+                -o output/dns_full.json 2>/dev/null || true
+
+              echo "=== Zone Transfer attempt ==="
+              for NS in $(dig +short NS "$DOMAIN" 2>/dev/null); do
+                dig axfr "$DOMAIN" @"$NS" 2>/dev/null \
+                  >> output/zone_transfer.txt || true
+              done
+
+              echo "=== Email Security (SPF/DMARC/DKIM) ==="
+              {
+                echo "--- SPF ---"
+                dig +short TXT "$DOMAIN" | grep -i 'v=spf' || echo "NO SPF FOUND"
+                echo "--- DMARC ---"
+                dig +short TXT "_dmarc.$DOMAIN" || echo "NO DMARC FOUND"
+                echo "--- DKIM (common selectors) ---"
+                for SEL in default google amazon ses mail dkim k1 smtp selector1; do
+                  RESULT=$(dig +short TXT "${SEL}._domainkey.$DOMAIN" 2>/dev/null)
+                  [ -n "$RESULT" ] && echo "selector=$SEL → $RESULT"
+                done
+              } > output/email_security.txt
+
+              echo "=== SSL/TLS Analysis (tlsx) ==="
+              echo "$DOMAIN" | tlsx -silent -json \
+                -san -cn -expired -self-signed \
+                -o output/tls_analysis.json 2>/dev/null || true
+
+              echo "=== Cert History (crt.sh) ==="
+              curl -s "https://crt.sh/?q=$DOMAIN&output=json" 2>/dev/null \
+                | jq -r '.[] | "\(.not_after) | \(.issuer_name) | \(.name_value)"' \
+                | sort -u > output/cert_details.txt || true
               ;;
-            "dns")
-              echo $DOMAIN | dnsx -silent -json -o output/passive/dns.json || true
-              jq -r '.host' output/passive/dns.json | sort -u > output/passive/all-hosts.txt || true
+
+            # ──────────────────────────────────────────────────────────────
+            # WAYBACK MACHINE → URLs Database
+            # gau + waybackurls → params + paths + juicy files + APIs
+            # ──────────────────────────────────────────────────────────────
+            "wayback")
+              echo "=== GAU (web archive) ==="
+              gau --threads 5 --subs --retries 3 "$DOMAIN" \
+                2>/dev/null > output/gau.txt || true
+
+              echo "=== Wayback Machine ==="
+              echo "$DOMAIN" | waybackurls 2>/dev/null \
+                > output/wayback_raw.txt || true
+
+              cat output/gau.txt output/wayback_raw.txt \
+                | sort -u > output/urls_all.txt
+
+              echo "=== Extract GET Params ==="
+              cat output/urls_all.txt | unfurl keys | sort -u \
+                > output/params_get.txt || true
+
+              echo "=== Extract Paths ==="
+              cat output/urls_all.txt | unfurl paths | sort -u \
+                > output/paths.txt || true
+
+              echo "=== Extract API Endpoints ==="
+              grep -iE '/(api|v[0-9]+|graphql|rest|ws|rpc)/' output/paths.txt \
+                | sort -u > output/api_endpoints.txt || true
+
+              echo "=== Juicy Files ==="
+              grep -iE '\.(env|log|bak|sql|config|xml|json|yaml|yml|key|pem|cer|pfx|p12|htpasswd|DS_Store|git|svn|swp|old|backup|conf|ini|toml|ovpn|rdp)(\?|$)' \
+                output/urls_all.txt | sort -u > output/urls_juicy.txt || true
+
+              echo "=== POST / Auth Endpoints ==="
+              grep -iE '(login|signin|auth|upload|submit|register|reset|forgot|checkout|payment|transfer|oauth|callback|token|refresh)' \
+                output/paths.txt | sort -u > output/post_endpoints.txt || true
+
+              echo "📦 URLs: $(wc -l < output/urls_all.txt)"
+              echo "📦 Params: $(wc -l < output/params_get.txt)"
+              echo "📦 Juicy: $(wc -l < output/urls_juicy.txt)"
+              echo "📦 APIs: $(wc -l < output/api_endpoints.txt)"
               ;;
-            "certs")
-              cero $DOMAIN > output/passive/certs.txt || true
+
+            # ──────────────────────────────────────────────────────────────
+            # TECH DETECTION
+            # httpx tech-detect + favicon + robots + sitemap + WHOIS + analytics IDs
+            # ──────────────────────────────────────────────────────────────
+            "tech-detection")
+              echo "=== Tech Detection via httpx ==="
+              echo "$DOMAIN" | httpx -silent -timeout 10 \
+                -title -server -td -favicon \
+                -json -o output/tech_main.json 2>/dev/null || true
+
+              echo "=== Robots.txt / Sitemap / security.txt ==="
+              curl -sk "https://$DOMAIN/robots.txt"                   > output/robots.txt     2>/dev/null || true
+              curl -sk "https://$DOMAIN/sitemap.xml"                  > output/sitemap.xml    2>/dev/null || true
+              curl -sk "https://$DOMAIN/.well-known/security.txt"     > output/security_txt.txt 2>/dev/null || true
+              curl -sk "https://$DOMAIN/humans.txt"                   > output/humans_txt.txt 2>/dev/null || true
+
+              echo "=== WHOIS ==="
+              whois "$DOMAIN" > output/whois.txt 2>/dev/null || true
+
+              echo "=== Reverse IP (shared hosting check) ==="
+              curl -s "https://api.hackertarget.com/reverseiplookup/?q=$MAIN_IP" \
+                > output/reverse_ip.txt 2>/dev/null || true
+
+              echo "=== Analytics IDs fingerprint ==="
+              curl -sk "https://$DOMAIN" 2>/dev/null \
+                | grep -oP '(UA-\d+-\d+|G-[A-Z0-9]+|GTM-[A-Z0-9]+|AW-\d+)' \
+                | sort -u > output/analytics_ids.txt || true
+
+              echo "=== URLScan history ==="
+              curl -s "https://urlscan.io/api/v1/search/?q=domain:$DOMAIN&size=30" \
+                2>/dev/null | jq '{total:.total, results:[.results[] | {url:.page.url, ip:.page.ip, country:.page.country, server:.page.server, date:.task.time}]}' \
+                > output/urlscan.json || true
               ;;
           esac
 
       - uses: actions/upload-artifact@v4
         with:
-          name: passive-${{ matrix.type }}
-          path: output/passive/
+          name: phase1-${{ matrix.type }}
+          path: output/
+          retention-days: 1
 
-  # 2. RECONHECIMENTO ATIVO
-  stealth-active:
-    name: Stealth Active
+# ══════════════════════════════════════════════════════════════════════════════
+# FASE 2 ── OSINT ANALYSIS
+# Parameter Extraction → OSINT Scanning (Nuclei custom) + Dorks + Emails + Shodan
+# ══════════════════════════════════════════════════════════════════════════════
+  phase2-osint:
+    name: "🎯 Phase2 — OSINT Analysis"
     runs-on: ubuntu-latest
-    needs: [setup, passive-recon]
+    needs: [setup, phase1-passive]
+
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
 
-      - name: Install httpx
-        run: go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+      - name: Install Tools
+        run: |
+          pip install -q theHarvester requests shodan 2>/dev/null || true
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          nuclei -update-templates 2>/dev/null || true
 
       - uses: actions/download-artifact@v4
         with:
-          name: passive-subdomains
-          path: passive-subdomains/
+          pattern: phase1-*
+          merge-multiple: true
+          path: phase1/
 
-      - name: Stealth HTTP Probing
+      # ── Nuclei OSINT: Exposures + Configs + Admin Panels ──────────────────
+      - name: Nuclei OSINT Scan (Custom Templates)
         env:
           MAX_RATE: ${{ needs.setup.outputs.max_rate }}
-          THREADS: 10
-          TIMEOUT: 5
-          DELAY: 1
-          MAX_TARGETS: ${{ github.event.inputs.max_targets || '1000' }}
+          THREADS:  ${{ needs.setup.outputs.threads }}
+          DOMAIN:   ${{ needs.setup.outputs.domain }}
+          SEVERITIES: ${{ github.event.inputs.nuclei_severities || 'low,medium,high,critical' }}
         run: |
-          mkdir -p output/active
-          head -n $MAX_TARGETS passive-subdomains/subdomains.txt | httpx \
-            -silent \
-            -threads $THREADS \
-            -rate-limit $MAX_RATE \
-            -timeout $TIMEOUT \
-            -delay $DELAY \
-            -p 80,443,8080,8443 \
-            -sc -title \
-            -json -o output/active/live.json
+          mkdir -p output/nuclei_osint /tmp/custom-tpl
+
+          # ── Custom Template: Sensitive Files ──────────────────────────────
+          cat > /tmp/custom-tpl/sensitive-files.yaml << 'YAML'
+id: custom-sensitive-files-extended
+info:
+  name: Extended Sensitive Files Detection
+  author: OSINT Recon Pipeline
+  severity: high
+  tags: exposure,config,osint,recon
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/.env"
+      - "{{BaseURL}}/.env.local"
+      - "{{BaseURL}}/.env.production"
+      - "{{BaseURL}}/.env.development"
+      - "{{BaseURL}}/.env.staging"
+      - "{{BaseURL}}/.env.backup"
+      - "{{BaseURL}}/.env.old"
+      - "{{BaseURL}}/config/.env"
+      - "{{BaseURL}}/app/.env"
+      - "{{BaseURL}}/.git/config"
+      - "{{BaseURL}}/.git/HEAD"
+      - "{{BaseURL}}/.git/index"
+      - "{{BaseURL}}/.git/logs/HEAD"
+      - "{{BaseURL}}/.gitignore"
+      - "{{BaseURL}}/.git-credentials"
+      - "{{BaseURL}}/config.php"
+      - "{{BaseURL}}/config.php.bak"
+      - "{{BaseURL}}/configuration.php"
+      - "{{BaseURL}}/config.json"
+      - "{{BaseURL}}/config.yml"
+      - "{{BaseURL}}/config.yaml"
+      - "{{BaseURL}}/settings.php"
+      - "{{BaseURL}}/settings.json"
+      - "{{BaseURL}}/app/config/config.yml"
+      - "{{BaseURL}}/database.sql"
+      - "{{BaseURL}}/db.sql"
+      - "{{BaseURL}}/backup.sql"
+      - "{{BaseURL}}/dump.sql"
+      - "{{BaseURL}}/database.sqlite"
+      - "{{BaseURL}}/backup.zip"
+      - "{{BaseURL}}/backup.tar.gz"
+      - "{{BaseURL}}/www.zip"
+      - "{{BaseURL}}/public_html.zip"
+      - "{{BaseURL}}/web.config"
+      - "{{BaseURL}}/.htaccess"
+      - "{{BaseURL}}/.htpasswd"
+      - "{{BaseURL}}/nginx.conf"
+      - "{{BaseURL}}/Dockerfile"
+      - "{{BaseURL}}/docker-compose.yml"
+      - "{{BaseURL}}/docker-compose.yaml"
+      - "{{BaseURL}}/.gitlab-ci.yml"
+      - "{{BaseURL}}/.travis.yml"
+      - "{{BaseURL}}/Jenkinsfile"
+      - "{{BaseURL}}/.github/workflows/deploy.yml"
+      - "{{BaseURL}}/composer.json"
+      - "{{BaseURL}}/package.json"
+      - "{{BaseURL}}/requirements.txt"
+      - "{{BaseURL}}/Pipfile"
+      - "{{BaseURL}}/.aws/credentials"
+      - "{{BaseURL}}/credentials.json"
+      - "{{BaseURL}}/aws.json"
+      - "{{BaseURL}}/secrets.json"
+      - "{{BaseURL}}/tokens.json"
+      - "{{BaseURL}}/private-key.pem"
+      - "{{BaseURL}}/id_rsa"
+      - "{{BaseURL}}/id_rsa.pub"
+      - "{{BaseURL}}/error.log"
+      - "{{BaseURL}}/debug.log"
+      - "{{BaseURL}}/access.log"
+      - "{{BaseURL}}/phpinfo.php"
+      - "{{BaseURL}}/info.php"
+      - "{{BaseURL}}/test.php"
+      - "{{BaseURL}}/.DS_Store"
+      - "{{BaseURL}}/wp-config.php"
+      - "{{BaseURL}}/wp-config.php.bak"
+      - "{{BaseURL}}/sites/default/settings.php"
+      - "{{BaseURL}}/config/database.yml"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        condition: or
+        words:
+          - "DB_PASSWORD"
+          - "API_KEY"
+          - "SECRET_KEY"
+          - "AWS_SECRET"
+          - "[core]"
+          - "<?php"
+          - "root:"
+          - "password"
+          - "token"
+          - "credentials"
+      - type: dsl
+        dsl:
+          - 'len(body) > 50'
+    extractors:
+      - type: regex
+        name: credentials
+        group: 1
+        regex:
+          - '(?i)(password|passwd|pwd|secret|token|api[_-]?key)\s*[:=]\s*["\x27]?([^\s"\x27\n]{6,})'
+          - '(?i)(DB_[A-Z_]+)\s*=\s*["\x27]?([^\s"\x27\n]+)'
+          - '(?i)(AWS_[A-Z_]+)\s*=\s*["\x27]?([^\s"\x27\n]+)'
+      - type: regex
+        name: db_conn
+        regex:
+          - '(?i)(mysql|postgresql|mongodb|redis|sqlite)://([^\s\n]+)'
+YAML
+
+          # ── Custom Template: Admin Panels ─────────────────────────────────
+          cat > /tmp/custom-tpl/admin-panels.yaml << 'YAML'
+id: custom-admin-panels
+info:
+  name: Admin Panel Discovery
+  author: OSINT Recon Pipeline
+  severity: medium
+  tags: panel,admin,login,dashboard
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/admin"
+      - "{{BaseURL}}/admin/"
+      - "{{BaseURL}}/administrator"
+      - "{{BaseURL}}/admin/login"
+      - "{{BaseURL}}/admin/dashboard"
+      - "{{BaseURL}}/wp-admin"
+      - "{{BaseURL}}/wp-login.php"
+      - "{{BaseURL}}/cpanel"
+      - "{{BaseURL}}/webmail"
+      - "{{BaseURL}}/admin.php"
+      - "{{BaseURL}}/manager"
+      - "{{BaseURL}}/management"
+      - "{{BaseURL}}/login"
+      - "{{BaseURL}}/signin"
+      - "{{BaseURL}}/dashboard"
+      - "{{BaseURL}}/portal"
+      - "{{BaseURL}}/console"
+      - "{{BaseURL}}/backend"
+      - "{{BaseURL}}/backoffice"
+      - "{{BaseURL}}/adminer"
+      - "{{BaseURL}}/adminer.php"
+      - "{{BaseURL}}/phpmyadmin"
+      - "{{BaseURL}}/phpMyAdmin"
+      - "{{BaseURL}}/pma"
+      - "{{BaseURL}}/dbadmin"
+      - "{{BaseURL}}/jenkins"
+      - "{{BaseURL}}/grafana"
+      - "{{BaseURL}}/kibana"
+      - "{{BaseURL}}/prometheus"
+      - "{{BaseURL}}/actuator"
+      - "{{BaseURL}}/actuator/env"
+      - "{{BaseURL}}/actuator/health"
+      - "{{BaseURL}}/actuator/mappings"
+      - "{{BaseURL}}/_cat/indices"
+      - "{{BaseURL}}/_cluster/health"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status: [200, 301, 302, 401, 403]
+      - type: word
+        condition: or
+        case-insensitive: true
+        words:
+          - "admin"
+          - "login"
+          - "dashboard"
+          - "sign in"
+          - "username"
+          - "password"
+          - "authentication"
+          - "control panel"
+          - "management"
+    extractors:
+      - type: regex
+        regex:
+          - '<title>([^<]+)</title>'
+YAML
+
+          # ── Custom Template: Info Disclosure ──────────────────────────────
+          cat > /tmp/custom-tpl/info-disclosure.yaml << 'YAML'
+id: custom-info-disclosure
+info:
+  name: Information Disclosure Detection
+  author: OSINT Recon Pipeline
+  severity: low
+  tags: disclosure,info,debug
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/phpinfo.php"
+      - "{{BaseURL}}/info.php"
+      - "{{BaseURL}}/test.php"
+      - "{{BaseURL}}/server-status"
+      - "{{BaseURL}}/server-info"
+      - "{{BaseURL}}/status"
+      - "{{BaseURL}}/.well-known/security.txt"
+      - "{{BaseURL}}/robots.txt"
+      - "{{BaseURL}}/sitemap.xml"
+      - "{{BaseURL}}/crossdomain.xml"
+      - "{{BaseURL}}/clientaccesspolicy.xml"
+    matchers-condition: or
+    matchers:
+      - type: word
+        condition: or
+        words:
+          - "PHP Version"
+          - "phpinfo()"
+          - "Apache Server Status"
+          - "Server Information"
+      - type: word
+        condition: or
+        words:
+          - "Disallow:"
+          - "<urlset"
+    extractors:
+      - type: regex
+        name: php_version
+        group: 1
+        regex:
+          - 'PHP Version ([0-9.]+)'
+      - type: regex
+        name: email
+        group: 1
+        regex:
+          - '([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
+YAML
+
+          # Targets: domínio principal + hosts vivos
+          echo "https://$DOMAIN" > /tmp/nuclei_targets.txt
+          echo "http://$DOMAIN"  >> /tmp/nuclei_targets.txt
+          cat phase1/subdomains.txt 2>/dev/null | head -n 30 \
+            | sed 's|^|https://|' >> /tmp/nuclei_targets.txt || true
+
+          BASE="-c $THREADS -rl $MAX_RATE -timeout 5 -retries 0 -mhe 10 -silent -jsonl"
+
+          # Custom templates
+          nuclei -l /tmp/nuclei_targets.txt \
+            -t /tmp/custom-tpl/ \
+            -severity $SEVERITIES \
+            $BASE -o output/nuclei_osint/custom_scan.jsonl 2>/dev/null || true
+
+          # Nuclei built-in: exposure + config
+          nuclei -l /tmp/nuclei_targets.txt \
+            -tags exposure,config,misconfig,token-spray \
+            -severity $SEVERITIES \
+            $BASE -o output/nuclei_osint/exposure_scan.jsonl 2>/dev/null || true
+
+          FOUND=$(cat output/nuclei_osint/*.jsonl 2>/dev/null | wc -l)
+          echo "🚨 Nuclei OSINT: $FOUND achados"
+
+      # ── Google Dorks ───────────────────────────────────────────────────────
+      - name: Google & GitHub Dorks
+        if: ${{ github.event.inputs.enable_dorks == 'true' }}
+        env:
+          DOMAIN: ${{ needs.setup.outputs.domain }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p output/dorks
+
+          cat > output/dorks/dorks_list.txt << DORKS
+site:$DOMAIN ext:env OR ext:log OR ext:bak OR ext:sql OR ext:conf
+site:$DOMAIN inurl:admin OR inurl:login OR inurl:dashboard OR inurl:portal
+site:$DOMAIN inurl:api OR inurl:swagger OR inurl:graphql OR inurl:v1 OR inurl:v2
+site:$DOMAIN intitle:"index of" OR intitle:"directory listing"
+site:$DOMAIN filetype:pdf OR filetype:docx OR filetype:xlsx OR filetype:pptx
+site:$DOMAIN intext:"username" intext:"password"
+site:$DOMAIN intext:"api_key" OR intext:"apikey" OR intext:"secret" OR intext:"token"
+site:$DOMAIN inurl:.git OR inurl:.svn OR inurl:.DS_Store OR inurl:.env
+site:$DOMAIN inurl:config OR inurl:setup OR inurl:install OR inurl:phpinfo
+site:$DOMAIN inurl:wp-content OR inurl:wp-admin OR inurl:wp-login
+site:$DOMAIN "internal use only" OR "confidential" OR "not for public"
+site:$DOMAIN inurl:actuator OR inurl:kibana OR inurl:grafana OR inurl:prometheus
+site:$DOMAIN inurl:jenkins OR inurl:teamcity OR inurl:bamboo OR inurl:circleci
+site:pastebin.com "$DOMAIN"
+site:pastebin.com "$DOMAIN" password OR secret OR token OR key
+site:github.com "$DOMAIN" password OR secret OR token OR key OR db_password
+site:github.com "$DOMAIN" PRIVATE_KEY OR private_key OR database_url OR smtp
+site:github.com "$DOMAIN" AWS_SECRET OR SENDGRID OR TWILIO OR STRIPE
+site:trello.com "$DOMAIN"
+site:jira.$DOMAIN OR inurl:jira "$DOMAIN"
+site:confluence.$DOMAIN
+site:s3.amazonaws.com "$DOMAIN"
+site:blob.core.windows.net "$DOMAIN"
+site:storage.googleapis.com "$DOMAIN"
+site:linkedin.com "at $DOMAIN" OR "@$DOMAIN"
+"@$DOMAIN" filetype:pdf OR filetype:doc
+DORKS
+
+          # Estrutura dorks por categoria (para o relatório)
+          python3 << 'PYEOF'
+import json, os
+domain = os.environ.get('DOMAIN','')
+with open('output/dorks/dorks_list.txt') as f:
+    dorks = [l.strip() for l in f if l.strip()]
+
+data = {
+    "domain": domain,
+    "total_dorks": len(dorks),
+    "categories": {
+        "sensitive_files":   [d for d in dorks if any(x in d for x in ['ext:','git','phpinfo','.env','.bak'])],
+        "admin_panels":      [d for d in dorks if any(x in d for x in ['admin','dashboard','portal','jenkins','kibana','grafana'])],
+        "api_endpoints":     [d for d in dorks if any(x in d for x in ['api','swagger','graphql'])],
+        "credentials":       [d for d in dorks if any(x in d for x in ['password','token','key','secret','PRIVATE'])],
+        "cloud_storage":     [d for d in dorks if any(x in d for x in ['s3.','blob.','storage.google'])],
+        "code_repos":        [d for d in dorks if any(x in d for x in ['github.com','pastebin'])],
+        "social_media":      [d for d in dorks if any(x in d for x in ['linkedin','trello'])],
+        "monitoring":        [d for d in dorks if any(x in d for x in ['kibana','grafana','prometheus','actuator'])],
+    },
+    "dorks": dorks
+}
+with open('output/dorks/dorks_structured.json','w') as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+print(f"🎣 {len(dorks)} dorks estruturados em {len(data['categories'])} categorias")
+PYEOF
+
+          # GitHub Code Search Dorking via API
+          python3 << 'PYEOF'
+import json, os, time, urllib.request, urllib.parse, urllib.error
+
+domain = os.environ.get('DOMAIN','')
+token  = os.environ.get('GH_TOKEN','')
+results = []
+
+queries = [
+    f'"{domain}" password',
+    f'"{domain}" secret OR token OR api_key',
+    f'"@{domain}" password',
+    f'"{domain}" DB_PASSWORD OR DATABASE_URL',
+    f'"{domain}" PRIVATE_KEY OR private_key',
+    f'"{domain}" smtp_password OR SENDGRID_KEY',
+    f'"{domain}" AWS_ACCESS_KEY OR AWS_SECRET_ACCESS_KEY',
+    f'"{domain}" STRIPE_KEY OR TWILIO_AUTH OR MAILGUN',
+]
+
+headers = {
+    'Authorization': f'Bearer {token}',
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28'
+}
+
+for q in queries:
+    try:
+        enc = urllib.parse.quote(q)
+        url = f'https://api.github.com/search/code?q={enc}&per_page=10'
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+            for item in data.get('items',[]):
+                results.append({
+                    'query': q,
+                    'repo':  item.get('repository',{}).get('full_name',''),
+                    'file':  item.get('path',''),
+                    'url':   item.get('html_url',''),
+                    'score': item.get('score',0)
+                })
+    except urllib.error.HTTPError as e:
+        print(f"GitHub API {e.code}: {q[:40]}")
+    except Exception as e:
+        print(f"GitHub error: {e}")
+    time.sleep(5)
+
+with open('output/dorks/github_findings.json','w') as f:
+    json.dump({'total': len(results), 'items': results}, f, indent=2)
+print(f"🐙 GitHub Dorks: {len(results)} resultados")
+PYEOF
+
+      # ── Email Harvesting + Shodan ──────────────────────────────────────────
+      - name: Email Harvesting & Threat Intel
+        env:
+          DOMAIN:         ${{ needs.setup.outputs.domain }}
+          MAIN_IP:        ${{ needs.setup.outputs.main_ip }}
+          SHODAN_API_KEY: ${{ secrets.SHODAN_API_KEY }}
+        run: |
+          mkdir -p output/osint
+
+          echo "=== theHarvester ==="
+          timeout 120 theHarvester -d "$DOMAIN" -l 300 \
+            -b bing,duckduckgo,yahoo,certspotter,crtsh,dnsx \
+            -f output/osint/harvester 2>/dev/null || true
+
+          echo "=== Shodan / HackerTarget ==="
+          if [ -n "$SHODAN_API_KEY" ]; then
+            python3 << 'PYEOF'
+import shodan, json, os
+try:
+    api    = shodan.Shodan(os.environ['SHODAN_API_KEY'])
+    domain = os.environ.get('DOMAIN','')
+    out    = {'domain_results':[], 'cves':[], 'open_ports':[]}
+    try:
+        r = api.search(f'hostname:{domain}')
+        for h in r.get('matches',[]):
+            entry = {
+                'ip':      h.get('ip_str'),
+                'port':    h.get('port'),
+                'product': h.get('product',''),
+                'version': h.get('version',''),
+                'os':      h.get('os',''),
+                'cves':    list(h.get('vulns',{}).keys()),
+                'tags':    h.get('tags',[]),
+                'banner':  h.get('data','')[:200]
+            }
+            out['domain_results'].append(entry)
+            out['cves'].extend(entry['cves'])
+            out['open_ports'].append(f"{entry['ip']}:{entry['port']}")
+    except Exception as e:
+        out['error'] = str(e)
+    out['cves'] = list(set(out['cves']))
+    with open('output/osint/shodan.json','w') as f:
+        json.dump(out, f, indent=2)
+    print(f"Shodan: {len(out['domain_results'])} hosts | CVEs: {out['cves']}")
+except ImportError:
+    print("shodan lib não instalada")
+PYEOF
+          else
+            curl -s "https://api.hackertarget.com/hostsearch/?q=$DOMAIN" \
+              > output/osint/hackertarget.txt 2>/dev/null || true
+            curl -s "https://api.hackertarget.com/nmap/?q=$MAIN_IP" \
+              > output/osint/nmap_quick.txt 2>/dev/null || true
+            echo '{"note":"sem SHODAN_API_KEY, usando HackerTarget free"}' \
+              > output/osint/shodan.json
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: stealth-active
-          path: output/active/
+          name: phase2-osint
+          path: output/
+          retention-days: 1
 
-  # 3. STEALTH VULN SCAN
-  stealth-vuln:
-    name: Stealth Vuln Scan
+# ══════════════════════════════════════════════════════════════════════════════
+# FASE 3 ── ACTIVE RECON
+# Directory Fuzzing (ffuf) + Endpoint Validation (httpx) + Form Detection + JS Analysis
+# ══════════════════════════════════════════════════════════════════════════════
+  phase3-active:
+    name: "🟢 Phase3 — Active Recon"
     runs-on: ubuntu-latest
-    needs: [stealth-active, passive-recon, setup]
+    needs: [setup, phase1-passive]
+
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
 
-      - name: Cache Nuclei Templates
-        uses: actions/cache@v4
+      - name: Install Tools
+        run: |
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest &
+          go install github.com/ffuf/ffuf/v2@latest                      &
+          go install github.com/sensepost/gowitness@latest               &
+          wait
+
+      - uses: actions/download-artifact@v4
         with:
-          path: /home/runner/nuclei-templates
-          key: ${{ runner.os }}-nuclei-templates-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-nuclei-templates-
+          pattern: phase1-*
+          merge-multiple: true
+          path: phase1/
+
+      # ── Endpoint Validation (httpx) ────────────────────────────────────────
+      - name: HTTP Probing & Endpoint Validation
+        env:
+          MAX_RATE:    ${{ needs.setup.outputs.max_rate }}
+          THREADS:     ${{ needs.setup.outputs.threads }}
+          MAX_TARGETS: ${{ github.event.inputs.max_targets || '500' }}
+        run: |
+          mkdir -p output/active
+
+          head -n "$MAX_TARGETS" phase1/subdomains.txt 2>/dev/null \
+            | httpx -silent \
+                -threads "$THREADS" \
+                -rate-limit "$MAX_RATE" \
+                -timeout 5 \
+                -p 80,443,8080,8443,8888,3000,4443,4000,9090,9200,5601 \
+                -sc -title -td -server -location -favicon \
+                -json -o output/active/live.json 2>/dev/null || true
+
+          jq -r '.url' output/active/live.json 2>/dev/null \
+            | sort -u > output/active/live_urls.txt || true
+          echo "🟢 $(wc -l < output/active/live_urls.txt 2>/dev/null || echo 0) hosts vivos"
+
+          if [ "${{ github.event.inputs.enable_portscan }}" = "true" ]; then
+            MAIN_IP="${{ needs.setup.outputs.main_ip }}"
+            curl -s "https://api.hackertarget.com/nmap/?q=$MAIN_IP" \
+              > output/active/portscan.txt 2>/dev/null || true
+          fi
+
+      # ── Directory Fuzzing (ffuf — rate limited) ────────────────────────────
+      - name: Directory Fuzzing (ffuf)
+        env:
+          MAX_RATE: ${{ needs.setup.outputs.max_rate }}
+        run: |
+          mkdir -p output/dirs
+
+          cat > /tmp/wordlist.txt << 'WL'
+.git
+.git/config
+.git/HEAD
+.env
+.env.local
+.env.production
+config.json
+config.yaml
+config.yml
+admin
+admin/login
+admin/dashboard
+api
+api/v1
+api/v2
+swagger
+swagger.json
+swagger-ui.html
+openapi.json
+graphql
+graphiql
+phpinfo.php
+robots.txt
+sitemap.xml
+security.txt
+.well-known/security.txt
+backup
+backup.zip
+backup.sql
+db.sql
+database.sql
+wp-admin
+wp-login.php
+wp-config.php
+wp-content/debug.log
+jenkins
+jenkins/login
+actuator
+actuator/health
+actuator/env
+actuator/mappings
+console
+phpmyadmin
+phpMyAdmin
+pma
+adminer
+adminer.php
+server-status
+server-info
+kibana
+grafana
+prometheus
+metrics
+health
+healthz
+debug
+login
+signin
+upload
+uploads
+files
+.DS_Store
+.htaccess
+.htpasswd
+web.config
+crossdomain.xml
+WL
+
+          head -n 5 output/active/live_urls.txt 2>/dev/null \
+          | while IFS= read -r TARGET; do
+            SAFE=$(echo "$TARGET" | sed 's|[^a-zA-Z0-9]|_|g')
+            ffuf -u "${TARGET}/FUZZ" \
+                 -w /tmp/wordlist.txt \
+                 -rate "$MAX_RATE" \
+                 -timeout 5 \
+                 -mc 200,204,301,302,401,403 \
+                 -fc 404 -t 5 \
+                 -o "output/dirs/ffuf_${SAFE}.json" \
+                 -of json -s 2>/dev/null || true
+          done || true
+
+          # Consolida resultados do ffuf
+          python3 << 'PYEOF'
+import json, glob, os
+results = []
+for f in glob.glob('output/dirs/ffuf_*.json'):
+    try:
+        with open(f) as fh:
+            data = json.load(fh)
+            for r in data.get('results',[]):
+                results.append({'url': r.get('url'), 'status': r.get('status'), 'length': r.get('length')})
+    except: pass
+with open('output/dirs/ffuf_consolidated.json','w') as f:
+    json.dump({'total': len(results), 'results': results}, f, indent=2)
+print(f"📂 ffuf: {len(results)} paths descobertos")
+PYEOF
+
+      # ── JavaScript Analysis & Secret Detection ─────────────────────────────
+      - name: JavaScript Analysis & Secret Detection
+        env:
+          DOMAIN: ${{ needs.setup.outputs.domain }}
+        run: |
+          mkdir -p output/js
+
+          python3 << 'PYEOF'
+import re, json, os, urllib.request, urllib.error
+
+PATTERNS = {
+    'aws_access_key':   r'AKIA[0-9A-Z]{16}',
+    'aws_secret_key':   r'(?i)aws[_-]?secret[_-]?access[_-]?key\s*[=:]\s*["\x27]?([A-Za-z0-9/+=]{40})',
+    'google_api_key':   r'AIza[0-9A-Za-z\-_]{35}',
+    'github_token':     r'ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82}',
+    'jwt_token':        r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
+    'bearer_token':     r'(?i)bearer\s+([A-Za-z0-9\-_.]{20,})',
+    'api_key_generic':  r'(?i)(api[_-]?key|apikey)["\s]*[:=]["\s]*([A-Za-z0-9\-_]{20,})',
+    'password_in_js':   r'(?i)(password|passwd|pwd)["\s]*[:=]["\s]*["\x27]([^"\']{6,})["\x27]',
+    'private_key':      r'-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----',
+    'internal_ips':     r'(?:10|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}',
+    'stripe_key':       r'sk_live_[0-9a-zA-Z]{24}',
+    'sendgrid_key':     r'SG\.[A-Za-z0-9\-_]{22}\.[A-Za-z0-9\-_]{43}',
+    'slack_token':      r'xox[baprs]-([0-9a-zA-Z]{10,48})',
+    'firebase_url':     r'https://[a-z0-9-]+\.firebaseio\.com',
+}
+
+SEV = {
+    'aws_access_key':'critical','private_key':'critical','stripe_key':'critical',
+    'github_token':'critical','sendgrid_key':'high','api_key_generic':'high',
+    'password_in_js':'high','slack_token':'high','google_api_key':'high',
+    'jwt_token':'medium','bearer_token':'medium',
+    'internal_ips':'low','firebase_url':'medium',
+}
+
+domain = os.environ.get('DOMAIN','')
+findings, js_files = [], []
+
+try:
+    req = urllib.request.Request(f'https://{domain}',
+                                  headers={'User-Agent':'Mozilla/5.0 (compatible; Googlebot/2.1)'})
+    html = urllib.request.urlopen(req, timeout=10).read().decode('utf-8','ignore')
+    for js in re.findall(r'src=["\x27]([^"\']+\.js[^"\']*)["\x27]', html):
+        if js.startswith('http'):       js_files.append(js)
+        elif js.startswith('//'):       js_files.append('https:'+js)
+        elif js.startswith('/'):        js_files.append(f'https://{domain}{js}')
+except Exception as e:
+    print(f"HTML fetch: {e}")
+
+for url in js_files[:25]:
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0'})
+        content = urllib.request.urlopen(req, timeout=8).read().decode('utf-8','ignore')
+        for pname, pattern in PATTERNS.items():
+            if re.search(pattern, content):
+                matches = re.findall(pattern, content)
+                findings.append({'url':url,'type':pname,
+                    'severity': SEV.get(pname,'medium'),
+                    'matches': [str(m)[:100] for m in matches[:3]]})
+    except: pass
+
+result = {'total_js_files':len(js_files),'total_findings':len(findings),'findings':findings,'js_urls':js_files}
+with open('output/js/js_analysis.json','w') as f:
+    json.dump(result, f, indent=2)
+
+crit = [x for x in findings if x['severity']=='critical']
+print(f"🔑 JS: {len(js_files)} arquivos | {len(findings)} achados | {len(crit)} críticos")
+PYEOF
+
+      - name: Screenshots (gowitness)
+        if: ${{ github.event.inputs.enable_screenshots == 'true' }}
+        run: |
+          mkdir -p output/screenshots
+          gowitness scan file \
+            --input-file output/active/live_urls.txt \
+            --screenshot-path output/screenshots \
+            --timeout 10 --threads 3 --delay 2 \
+            2>/dev/null || true
+          echo "📸 $(ls output/screenshots/*.png 2>/dev/null | wc -l) screenshots"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phase3-active
+          path: output/
+          retention-days: 1
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FASE 4 ── VULNERABILITY SCANNING
+# Nuclei Full Scan → Filter by Severity (Critical / High / Medium / Low)
+# ══════════════════════════════════════════════════════════════════════════════
+  phase4-vuln:
+    name: "🚨 Phase4 — Vulnerability Scan"
+    runs-on: ubuntu-latest
+    needs: [setup, phase1-passive, phase3-active]
+
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
 
       - name: Setup Nuclei
         run: |
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          nuclei -update-templates
+          nuclei -update-templates 2>/dev/null || true
 
       - uses: actions/download-artifact@v4
         with:
-          name: stealth-active
-          path: stealth-active/
+          pattern: phase1-*
+          merge-multiple: true
+          path: phase1/
 
       - uses: actions/download-artifact@v4
         with:
-          name: passive-subdomains
-          path: passive-subdomains/
+          name: phase3-active
+          path: phase3/
 
-      - name: Stealth Nuclei
+      - name: Nuclei Full Scan
         env:
-          MAX_RATE: ${{ needs.setup.outputs.max_rate }}
-          THREADS: 10
-          TIMEOUT: 3
-          SEVERITIES: ${{ github.event.inputs.nuclei_severities || 'info,low,medium,high,critical' }}
-          MODE: ${{ github.event.inputs.scan_mode }}
+          MAX_RATE:    ${{ needs.setup.outputs.max_rate }}
+          THREADS:     ${{ needs.setup.outputs.threads }}
+          SEVERITIES:  ${{ github.event.inputs.nuclei_severities || 'low,medium,high,critical' }}
+          MODE:        ${{ github.event.inputs.scan_mode }}
+          MAX_TARGETS: ${{ github.event.inputs.max_targets || '500' }}
         run: |
           mkdir -p output/vuln
-          cat passive-subdomains/subdomains.txt > targets.txt
-          cat stealth-active/live.json | jq -r '.url' >> targets.txt 2>/dev/null || true
-          sort -u targets.txt -o targets.txt
-          
-          if [[ "$MODE" == *"Discovery"* ]]; then
-            echo "Rodando modo Discovery (Apenas Exposições)..."
-            nuclei -l targets.txt \
-              -tags exposure,config \
-              -severity $SEVERITIES \
-              -c $THREADS \
-              -rl $MAX_RATE \
-              -timeout $TIMEOUT \
-              -retries 0 \
-              -mhe 15 \
-              -silent \
-              -jsonl -o output/vuln/nuclei.jsonl
-          
-          elif [[ "$MODE" == *"Targeted"* ]]; then
-            echo "Rodando modo Targeted (Automatic Technology Scan)..."
-            nuclei -l targets.txt \
-              -as \
-              -severity $SEVERITIES \
-              -c $THREADS \
-              -rl $MAX_RATE \
-              -timeout $TIMEOUT \
-              -retries 0 \
-              -mhe 15 \
-              -silent \
-              -jsonl -o output/vuln/nuclei.jsonl
 
-          else
-            echo "Rodando modo Full-Aggressive (Vai demorar!)..."
-            nuclei -l targets.txt \
-              -tags misconfiguration,http-headers,cve,file,exposure \
-              -severity $SEVERITIES \
-              -c $THREADS \
-              -rl $MAX_RATE \
-              -timeout $TIMEOUT \
-              -retries 0 \
-              -mhe 15 \
-              -silent \
-              -jsonl -o output/vuln/nuclei.jsonl
-          fi
-            
+          head -n "$MAX_TARGETS" phase1/subdomains.txt 2>/dev/null > /tmp/targets.txt || true
+          jq -r '.url' phase3/live.json 2>/dev/null >> /tmp/targets.txt || true
+          sort -u /tmp/targets.txt -o /tmp/targets.txt
+          echo "🎯 $(wc -l < /tmp/targets.txt) targets"
+
+          BASE="-l /tmp/targets.txt -severity $SEVERITIES -c $THREADS -rl $MAX_RATE -timeout 5 -retries 0 -mhe 15 -silent -jsonl"
+
+          case "$MODE" in
+            *"Discovery"*)
+              nuclei $BASE -tags exposure,config,misconfig,token-spray \
+                -o output/vuln/nuclei_results.jsonl 2>/dev/null || true
+              ;;
+            *"Aggressive"*)
+              nuclei $BASE \
+                -tags misconfiguration,http-headers,cve,file,exposure,default-login,panel,rce,ssrf,sqli,xss,lfi,redirect \
+                -o output/vuln/nuclei_results.jsonl 2>/dev/null || true
+              ;;
+            *)
+              # Targeted: auto-scan tech + CVEs
+              nuclei $BASE -as \
+                -o output/vuln/nuclei_targeted.jsonl 2>/dev/null || true
+              nuclei $BASE -tags cve,default-login \
+                -o output/vuln/nuclei_cves.jsonl 2>/dev/null || true
+              cat output/vuln/nuclei_targeted.jsonl output/vuln/nuclei_cves.jsonl \
+                > output/vuln/nuclei_results.jsonl 2>/dev/null || true
+              ;;
+          esac
+
+          # Classifica por severidade
+          python3 << 'PYEOF'
+import json, glob
+
+all_findings, seen = [], set()
+for f in glob.glob('output/vuln/*.jsonl'):
+    with open(f) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line: continue
+            try:
+                item = json.loads(line)
+                key = f"{item.get('template-id','')}{item.get('host','')}{item.get('matched-at','')}"
+                if key not in seen:
+                    seen.add(key)
+                    all_findings.append(item)
+            except: pass
+
+by_sev = {'critical':[],'high':[],'medium':[],'low':[],'info':[]}
+for f in all_findings:
+    s = f.get('info',{}).get('severity','info').lower()
+    by_sev.setdefault(s,[]).append(f)
+
+summary = {k:len(v) for k,v in by_sev.items()}
+print(f"🚨 Nuclei → {summary}")
+
+for sev, items in by_sev.items():
+    if items:
+        with open(f'output/vuln/severity_{sev}.json','w') as f:
+            json.dump(items, f, indent=2)
+
+with open('output/vuln/all_findings.json','w') as f:
+    json.dump({'summary':summary,'findings':all_findings}, f, indent=2)
+
+print(f"✅ Total: {len(all_findings)} vulnerabilidades")
+PYEOF
+
       - uses: actions/upload-artifact@v4
         with:
-          name: stealth-vuln
+          name: phase4-vuln
           path: output/vuln/
+          retention-days: 1
 
-  # 4. RELATÓRIO FINAL
-  stealth-report:
-    name: Final Report
+# ══════════════════════════════════════════════════════════════════════════════
+# FASE 5 ── DATA PROCESSING
+# Normalize Findings → Remove Duplicates → Classify by Type → Enrich with Context
+# Output: normalized-findings.json
+# ══════════════════════════════════════════════════════════════════════════════
+  phase5-normalize:
+    name: "📊 Phase5 — Data Processing"
     runs-on: ubuntu-latest
-    needs: [stealth-vuln, passive-recon, stealth-active, setup]
-    steps:
-      - name: Download All Results
-        uses: actions/download-artifact@v4
-        with:
-          path: results/
-          merge-multiple: true
+    needs: [setup, phase1-passive, phase2-osint, phase3-active, phase4-vuln]
 
-      - name: Generate Report
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: phase1-*
+          merge-multiple: true
+          path: all/phase1/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: phase2-osint
+          path: all/phase2/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: phase3-active
+          path: all/phase3/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: phase4-vuln
+          path: all/phase4/
+
+      - name: Normalize, Deduplicate, Classify & Enrich
+        env:
+          DOMAIN:        ${{ needs.setup.outputs.domain }}
+          MAIN_IP:       ${{ needs.setup.outputs.main_ip }}
+          ASN:           ${{ needs.setup.outputs.asn }}
+          ORG:           ${{ needs.setup.outputs.org }}
+          REGISTRAR:     ${{ needs.setup.outputs.registrar }}
+          TECH_HINT:     ${{ needs.setup.outputs.tech_hint }}
+          SCAN_ID:       ${{ env.SCAN_ID }}
+          STEALTH_LEVEL: ${{ github.event.inputs.stealth_level }}
+          SCAN_MODE:     ${{ github.event.inputs.scan_mode }}
+        run: |
+          mkdir -p output
+
+          python3 << 'PYEOF'
+import json, glob, os, re, hashlib
+from datetime import datetime, timezone
+
+domain    = os.environ.get('DOMAIN','')
+main_ip   = os.environ.get('MAIN_IP','')
+asn       = os.environ.get('ASN','')
+org       = os.environ.get('ORG','')
+registrar = os.environ.get('REGISTRAR','')
+tech_hint = os.environ.get('TECH_HINT','')
+scan_id   = os.environ.get('SCAN_ID','')
+scan_ts   = datetime.now(timezone.utc).isoformat()
+
+def read_lines(path):
+    try:
+        with open(path) as f: return [l.strip() for l in f if l.strip()]
+    except: return []
+
+def read_json(path):
+    try:
+        with open(path) as f: return json.load(f)
+    except: return {}
+
+# ── Subdomains ───────────────────────────────────────────────────────────────
+subdomains = set()
+for p in glob.glob('all/phase1/subdomains.txt'):
+    for line in read_lines(p): subdomains.add(line)
+
+# ── Live Hosts ───────────────────────────────────────────────────────────────
+live_hosts, seen_urls = [], set()
+for p in glob.glob('all/phase3/active/live.json'):
+    for line in read_lines(p):
+        try:
+            h = json.loads(line)
+            url = h.get('url','')
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                live_hosts.append({'url':url,'status':h.get('status_code'),
+                    'title':h.get('title',''),'server':h.get('webserver',''),
+                    'tech':h.get('tech',[]),'favicon':h.get('favicon-mmh3','')})
+        except: pass
+
+# ── Vuln Findings ────────────────────────────────────────────────────────────
+vuln_findings, seen_hashes = [], set()
+for p in glob.glob('all/phase4/all_findings.json'):
+    try:
+        d = read_json(p)
+        for item in d.get('findings',[]):
+            h = hashlib.md5(f"{item.get('template-id','')}{item.get('matched-at','')}".encode()).hexdigest()
+            if h not in seen_hashes:
+                seen_hashes.add(h)
+                info = item.get('info',{})
+                vuln_findings.append({
+                    'id':          item.get('template-id',''),
+                    'name':        info.get('name',''),
+                    'severity':    info.get('severity','info'),
+                    'host':        item.get('host',''),
+                    'url':         item.get('matched-at',''),
+                    'tags':        info.get('tags',[]),
+                    'description': info.get('description',''),
+                    'cvss_score':  info.get('classification',{}).get('cvss-score',''),
+                    'cve':         info.get('classification',{}).get('cve-id',''),
+                    'extracted':   item.get('extracted-results',[]),
+                })
+    except: pass
+
+# Inclui achados Nuclei OSINT
+for p in glob.glob('all/phase2/nuclei_osint/*.jsonl'):
+    for line in read_lines(p):
+        try:
+            item = json.loads(line)
+            h = hashlib.md5(f"{item.get('template-id','')}{item.get('matched-at','')}".encode()).hexdigest()
+            if h not in seen_hashes:
+                seen_hashes.add(h)
+                info = item.get('info',{})
+                vuln_findings.append({'id':item.get('template-id',''),
+                    'name':info.get('name',''),'severity':info.get('severity','info'),
+                    'host':item.get('host',''),'url':item.get('matched-at',''),
+                    'tags':info.get('tags',[]),'description':info.get('description',''),
+                    'cvss_score':'','cve':'','extracted':item.get('extracted-results',[])})
+        except: pass
+
+# ── URLs & Params ────────────────────────────────────────────────────────────
+params       = read_lines('all/phase1/params_get.txt')[:300]
+juicy_urls   = read_lines('all/phase1/urls_juicy.txt')[:100]
+api_endpoints= read_lines('all/phase1/api_endpoints.txt')[:100]
+post_endpoints= read_lines('all/phase1/post_endpoints.txt')[:50]
+
+# ── OSINT Data ───────────────────────────────────────────────────────────────
+dorks_data   = read_json('all/phase2/dorks/dorks_structured.json')
+github_data  = read_json('all/phase2/dorks/github_findings.json')
+shodan_data  = read_json('all/phase2/osint/shodan.json')
+js_data      = read_json('all/phase3/js/js_analysis.json')
+ffuf_data    = read_json('all/phase3/dirs/ffuf_consolidated.json')
+email_sec    = ''.join(read_lines('all/phase1/email_security.txt'))
+tls_data     = read_json('all/phase1/tls_analysis.json') if os.path.exists('all/phase1/tls_analysis.json') else []
+
+# ── Classify by Type ─────────────────────────────────────────────────────────
+def has_tag(v, tags): return any(t in (v.get('tags') or []) for t in tags)
+
+classified = {
+    'exposure':         [v for v in vuln_findings if has_tag(v,['exposure','config','misconfig'])],
+    'admin_panels':     [v for v in vuln_findings if has_tag(v,['admin','panel','login','dashboard'])],
+    'cves':             [v for v in vuln_findings if v.get('cve')],
+    'default_creds':    [v for v in vuln_findings if has_tag(v,['default-login','default-credentials'])],
+    'info_disclosure':  [v for v in vuln_findings if has_tag(v,['disclosure','info','debug'])],
+    'injection':        [v for v in vuln_findings if has_tag(v,['sqli','xss','rce','ssti','xxe','lfi','ssrf'])],
+    'misconfiguration': [v for v in vuln_findings if has_tag(v,['misconfiguration','headers','cors'])],
+}
+
+by_severity = {}
+for v in vuln_findings:
+    s = v.get('severity','info')
+    by_severity.setdefault(s,[]).append(v)
+
+# ── Build normalized-findings.json ───────────────────────────────────────────
+normalized = {
+    'meta': {
+        'scan_id':       scan_id,
+        'timestamp':     scan_ts,
+        'domain':        domain,
+        'main_ip':       main_ip,
+        'asn':           asn,
+        'org':           org,
+        'registrar':     registrar,
+        'server_tech':   tech_hint,
+        'scan_mode':     os.environ.get('SCAN_MODE',''),
+        'stealth_level': os.environ.get('STEALTH_LEVEL',''),
+    },
+    'summary': {
+        'subdomains_total': len(subdomains),
+        'live_hosts':       len(live_hosts),
+        'vulns_critical':   len(by_severity.get('critical',[])),
+        'vulns_high':       len(by_severity.get('high',[])),
+        'vulns_medium':     len(by_severity.get('medium',[])),
+        'vulns_low':        len(by_severity.get('low',[])),
+        'vulns_info':       len(by_severity.get('info',[])),
+        'params_found':     len(params),
+        'juicy_urls':       len(juicy_urls),
+        'api_endpoints':    len(api_endpoints),
+        'github_leaks':     github_data.get('total',0),
+        'js_secrets':       js_data.get('total_findings',0),
+        'shodan_hosts':     len(shodan_data.get('domain_results',[])),
+        'exposed_cves':     len(shodan_data.get('cves',[])),
+        'dirs_found':       ffuf_data.get('total',0),
+    },
+    'phase1_passive': {
+        'subdomains':       sorted(list(subdomains))[:500],
+        'tls_analysis':     tls_data,
+        'email_security':   email_sec,
+        'params':           params,
+        'api_endpoints':    api_endpoints,
+        'post_endpoints':   post_endpoints,
+        'juicy_urls':       juicy_urls,
+    },
+    'phase2_osint': {
+        'dorks':        dorks_data,
+        'github_leaks': github_data,
+        'shodan':       shodan_data,
+    },
+    'phase3_active': {
+        'live_hosts':   live_hosts[:200],
+        'js_analysis':  js_data,
+        'dirs_found':   ffuf_data,
+    },
+    'phase4_vulns': {
+        'by_severity':  by_severity,
+        'classified':   {k: len(v) for k,v in classified.items()},
+        'all_findings': vuln_findings[:500],
+    },
+}
+
+with open('output/normalized-findings.json','w') as f:
+    json.dump(normalized, f, indent=2, ensure_ascii=False)
+
+print(f"""
+✅ DATA PROCESSING CONCLUÍDO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🌐 Subdomains:   {len(subdomains)}
+🟢 Live Hosts:   {len(live_hosts)}
+🔴 Critical:     {len(by_severity.get('critical',[]))}
+🟠 High:         {len(by_severity.get('high',[]))}
+🟡 Medium:       {len(by_severity.get('medium',[]))}
+🔵 Low:          {len(by_severity.get('low',[]))}
+🎣 GitHub leaks: {github_data.get('total',0)}
+🔑 JS secrets:   {js_data.get('total_findings',0)}
+📂 Dirs found:   {ffuf_data.get('total',0)}
+""")
+PYEOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phase5-normalized
+          path: output/
+          retention-days: 7
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FASE 6 ── AI REPORT (Gemini 2.0 Flash)
+# Correlaciona resultados → Attack Chains → Threat Model → Relatório Markdown
+# ══════════════════════════════════════════════════════════════════════════════
+  phase6-ai-report:
+    name: "🤖 Phase6 — Gemini AI Report"
+    runs-on: ubuntu-latest
+    needs: [setup, phase5-normalize]
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: phase5-normalized
+          path: normalized/
+
+      - name: Generate Gemini AI Report
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DOMAIN:         ${{ needs.setup.outputs.domain }}
+          SCAN_ID:        ${{ env.SCAN_ID }}
+        run: |
+          mkdir -p output/report
+
+          python3 << 'PYEOF'
+import json, os, time, urllib.request, urllib.error
+from datetime import datetime, timezone
+
+GEMINI_KEY = os.environ.get('GEMINI_API_KEY','')
+DOMAIN     = os.environ.get('DOMAIN','')
+SCAN_ID    = os.environ.get('SCAN_ID','')
+MODEL      = 'gemini-2.0-flash'
+GEMINI_URL = f'https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={GEMINI_KEY}'
+
+# Carrega normalized-findings.json
+with open('normalized/normalized-findings.json') as f:
+    data = json.load(f)
+
+meta    = data.get('meta',{})
+summary = data.get('summary',{})
+p1      = data.get('phase1_passive',{})
+p2      = data.get('phase2_osint',{})
+p3      = data.get('phase3_active',{})
+p4      = data.get('phase4_vulns',{})
+
+# ── Gemini helper ────────────────────────────────────────────────────────────
+def gemini(prompt: str, max_tokens: int = 4096) -> str:
+    if not GEMINI_KEY:
+        return "⚠️  GEMINI_API_KEY não configurado. Adicione em Settings → Secrets → Actions."
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.3}
+    }).encode()
+    req = urllib.request.Request(GEMINI_URL, data=body,
+                                  headers={"Content-Type":"application/json"})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                r = json.loads(resp.read())
+                return r['candidates'][0]['content']['parts'][0]['text']
+        except urllib.error.HTTPError as e:
+            err = e.read().decode()
+            if e.code == 429:
+                print(f"Rate limit, aguardando {30*(attempt+1)}s...")
+                time.sleep(30 * (attempt+1))
+            else:
+                return f"Gemini API error {e.code}: {err[:300]}"
+        except Exception as e:
+            print(f"Tentativa {attempt+1} falhou: {e}")
+            time.sleep(15)
+    return "Gemini não respondeu após 3 tentativas."
+
+# ── Prepara contexto resumido (limite de tokens) ──────────────────────────────
+critical_vulns   = p4.get('by_severity',{}).get('critical',[])[:10]
+high_vulns       = p4.get('by_severity',{}).get('high',[])[:10]
+js_findings      = p3.get('js_analysis',{}).get('findings',[])[:8]
+github_items     = p2.get('github_leaks',{}).get('items',[])[:8]
+live_hosts_sample= p3.get('live_hosts',[])[:15]
+shodan_cves      = p2.get('shodan',{}).get('cves',[])
+api_eps          = p1.get('api_endpoints',[])[:20]
+post_eps         = p1.get('post_endpoints',[])[:15]
+juicy            = p1.get('juicy_urls',[])[:15]
+subs_sample      = p1.get('subdomains',[])[:30]
+email_sec        = p1.get('email_security','')[:600]
+dork_cats        = p2.get('dorks',{}).get('categories',{})
+dirs_found       = p3.get('dirs_found',{}).get('results',[])[:20]
+
+ctx_obj = {
+    "target": DOMAIN,
+    "meta": meta,
+    "summary": summary,
+    "critical_vulns":     critical_vulns,
+    "high_vulns":         high_vulns,
+    "js_secrets":         js_findings,
+    "github_leaks":       github_items,
+    "live_hosts":         live_hosts_sample,
+    "shodan_cves":        shodan_cves,
+    "api_endpoints":      api_eps,
+    "post_endpoints":     post_eps,
+    "juicy_urls":         juicy,
+    "dirs_found":         dirs_found,
+    "email_security":     email_sec,
+    "subdomains_sample":  subs_sample,
+    "dork_categories":    {k: len(v) for k,v in dork_cats.items()},
+}
+ctx_json = json.dumps(ctx_obj, ensure_ascii=False)[:14000]
+
+# ══ PROMPT 1: CORRELAÇÃO & ATTACK CHAINS ════════════════════════════════════
+print("🤖 [1/3] Gerando correlação e attack chains...")
+attack_chains = gemini(f"""
+Você é um pentester sênior e especialista em OSINT. Analise os resultados do recon abaixo e produza uma análise técnica profunda de correlação de dados e vetores de ataque.
+
+## DADOS DO RECON — {DOMAIN}
+```json
+{ctx_json}
+```
+
+## TAREFA: CORRELAÇÃO & ATTACK CHAINS
+
+### 🔗 1. CORRELAÇÃO DE DADOS
+Explique como os achados se conectam entre si para formar ameaças compostas. Seja específico com os dados encontrados. Exemplos de correlações a buscar:
+- Subdomínio + painel admin exposto + tecnologia desatualizada
+- Arquivo .env ou configuração exposta + credenciais encontradas no GitHub
+- Endpoint de API + parâmetros do Wayback + possível SQLi/IDOR
+- Certificado SSL + wildcard + possibilidade de phishing
+- SPF/DMARC ausente + emails coletados = risco de email spoofing
+- CVEs Shodan + versão de servidor + exploit público disponível
+- JS com secrets + endpoints internos = acesso a infraestrutura
+
+### ⛓️ 2. TOP 5 ATTACK CHAINS
+Para cada cadeia, forneça:
+**Chain [N]: [Nome descritivo]**
+- **Pré-requisitos**: O que o atacante precisa ter
+- **Passo a passo**: Numerado e técnico
+- **Ferramentas**: Ferramentas específicas (Metasploit, sqlmap, hydra, etc.)
+- **Impacto**: O que pode ser comprometido (dados, acesso, etc.)
+- **Probabilidade**: Alta/Média/Baixa — com justificativa baseada nos dados
+
+### 🗺️ 3. MAPA DE SUPERFÍCIE DE ATAQUE
+Organize os pontos de entrada por criticidade:
+| Ponto de Entrada | Tipo | Risco | Condição |
+|---|---|---|---|
+
+### 🛡️ 4. TOP 10 REMEDIAÇÕES PRIORITÁRIAS
+Ordenadas por urgência, com dificuldade de implementação (Baixa/Média/Alta).
+
+Use SOMENTE os dados fornecidos. Seja técnico e específico.
+""", max_tokens=4096)
+
+time.sleep(8)
+print("🤖 [2/3] Gerando Executive Summary...")
+
+# ══ PROMPT 2: EXECUTIVE SUMMARY ══════════════════════════════════════════════
+exec_summary = gemini(f"""
+Você é um consultor de segurança sênior escrevendo para o CISO/CTO de uma empresa.
+
+## CONTEXTO DO SCAN — {DOMAIN}
+- IP Principal: {meta.get('main_ip','')}
+- ASN/Org: {meta.get('asn','')} / {meta.get('org','')}
+- Tecnologia detectada: {meta.get('server_tech','')}
+- Subdomínios: {summary.get('subdomains_total',0)}
+- Hosts ativos: {summary.get('live_hosts',0)}
+- Vulnerabilidades críticas: {summary.get('vulns_critical',0)}
+- Vulnerabilidades altas: {summary.get('vulns_high',0)}
+- Vazamentos no GitHub: {summary.get('github_leaks',0)}
+- Secrets em JavaScript: {summary.get('js_secrets',0)}
+- CVEs expostos (Shodan): {shodan_cves[:5]}
+- Segurança de email: {email_sec[:400]}
+
+## TAREFA: EXECUTIVE SUMMARY
+
+Escreva em português, linguagem executiva (sem jargão técnico excessivo):
+
+**🎯 NÍVEL DE RISCO GERAL**: [Crítico/Alto/Médio/Baixo] — Score: X/10
+(com justificativa em 2-3 linhas)
+
+**📌 PRINCIPAIS DESCOBERTAS** (máximo 5, em bullets concisos):
+Foque no impacto de negócio, não nos detalhes técnicos.
+
+**💼 IMPACTO POTENCIAL NO NEGÓCIO**:
+O que pode acontecer se as vulnerabilidades forem exploradas (vazamento de dados, downtime, comprometimento de clientes, danos à reputação, regulatório/LGPD).
+
+**📧 POSTURA DE EMAIL**:
+Análise do SPF/DMARC/DKIM e risco de phishing/spoofing.
+
+**⚡ 3 AÇÕES IMEDIATAS (próximas 72h)**:
+Ações concretas e realizáveis.
+
+**📅 CRONOGRAMA SUGERIDO**:
+- Curto prazo (1-7 dias): ...
+- Médio prazo (1-4 semanas): ...
+- Longo prazo (1-3 meses): ...
+""", max_tokens=2048)
+
+time.sleep(8)
+print("🤖 [3/3] Gerando Threat Intelligence...")
+
+# ══ PROMPT 3: THREAT INTELLIGENCE ════════════════════════════════════════════
+threat_intel = gemini(f"""
+Você é um analista de Threat Intelligence com foco em segurança ofensiva.
+
+## ALVO: {DOMAIN}
+- Tech stack: {meta.get('server_tech','unknown')}
+- CVEs expostos: {json.dumps(shodan_cves[:15])}
+- Vulnerabilidades críticas: {json.dumps([v.get('name','') for v in critical_vulns])}
+- Subdomínios notáveis: {json.dumps(subs_sample[:20])}
+- APIs: {json.dumps(api_eps[:15])}
+- POST endpoints: {json.dumps(post_eps[:10])}
+- GitHub leaks: {json.dumps([i.get('file','') for i in github_items[:8]])}
+- JS secrets: {json.dumps([f.get('type','') for f in js_findings[:8]])}
+
+## TAREFA: THREAT INTELLIGENCE REPORT
+
+### 🏢 PERFIL DE INFRAESTRUTURA INFERIDA
+Descreva a stack tecnológica provável, maturidade de segurança aparente, e tipo de aplicação (e-commerce, SaaS, corporate, etc.) baseado nos dados.
+
+### 💀 ANÁLISE DE CVEs E VULNERABILIDADES
+Para cada CVE/vuln encontrada:
+- O que permite explorar
+- Exploit público disponível? (Metasploit module, PoC, etc.)
+- CVSS score e impacto
+- Dificuldade de exploração: 1 (trivial) a 5 (complexo)
+
+### 🚪 VETORES DE ACESSO EXTERNO
+**Anônimo (sem credenciais):**
+Liste os vetores acessíveis sem autenticação.
+
+**Pós-phishing (usuário comprometido):**
+O que é possível com credenciais de um funcionário.
+
+**Via supply chain (CI/CD, dependências):**
+Riscos identificados em pipelines e dependências.
+
+### 🔍 INDICADORES DE COMPROMETIMENTO POTENCIAL
+Sinais que indicariam que o alvo JÁ pode estar comprometido (baseado nos dados coletados).
+
+### 🎣 TOP 10 DORKS PRIORITÁRIOS
+Para investigação manual, baseado na tech stack detectada.
+""", max_tokens=3000)
+
+# ══ GERA RELATÓRIO MARKDOWN ═══════════════════════════════════════════════════
+ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+sev_emoji = {"critical":"🔴","high":"🟠","medium":"🟡","low":"🔵","info":"⚪"}
+
+md = f"""# 🥷 Advanced OSINT & Recon Report — AI-Powered
+
+> **Target:** `{DOMAIN}` &nbsp;|&nbsp; **Scan ID:** `{SCAN_ID}` &nbsp;|&nbsp; **Generated:** {ts}
+> **Mode:** {meta.get('scan_mode','')} &nbsp;|&nbsp; **Stealth:** {meta.get('stealth_level','')}
+
+---
+
+## 📋 Executive Summary
+
+{exec_summary}
+
+---
+
+## 📊 Dashboard — Findings Overview
+
+| Categoria | Valor |
+|:---|:---|
+| 🌐 Subdomínios Descobertos | **{summary.get('subdomains_total',0)}** |
+| 🟢 Hosts Ativos | **{summary.get('live_hosts',0)}** |
+| 🔴 Vulnerabilidades Críticas | **{summary.get('vulns_critical',0)}** |
+| 🟠 Vulnerabilidades Altas | **{summary.get('vulns_high',0)}** |
+| 🟡 Vulnerabilidades Médias | **{summary.get('vulns_medium',0)}** |
+| 🔵 Vulnerabilidades Baixas | **{summary.get('vulns_low',0)}** |
+| 🎣 Vazamentos GitHub | **{summary.get('github_leaks',0)}** |
+| 🔑 Secrets em JavaScript | **{summary.get('js_secrets',0)}** |
+| 🌍 Hosts no Shodan | **{summary.get('shodan_hosts',0)}** |
+| 💀 CVEs Expostos | **{summary.get('exposed_cves',0)}** |
+| 📎 Parâmetros GET/POST | **{summary.get('params_found',0)}** |
+| 🔗 Endpoints de API | **{summary.get('api_endpoints',0)}** |
+| 📁 URLs Sensíveis | **{summary.get('juicy_urls',0)}** |
+| 📂 Diretórios Descobertos | **{summary.get('dirs_found',0)}** |
+
+---
+
+## 🎯 Target Intelligence
+
+| Campo | Valor |
+|:---|:---|
+| Domínio | `{DOMAIN}` |
+| IP Principal | `{meta.get('main_ip','')}` |
+| ASN | `{meta.get('asn','')}` |
+| Organização | `{meta.get('org','')}` |
+| Registrar | `{meta.get('registrar','')}` |
+| Tecnologia Detectada | `{meta.get('server_tech','')}` |
+
+---
+
+## 🔗 Correlação & Attack Chains
+
+{attack_chains}
+
+---
+
+## 🕵️ Threat Intelligence
+
+{threat_intel}
+
+---
+
+## 🚨 Vulnerabilidades por Severidade
+
+"""
+
+for sev in ['critical','high','medium','low','info']:
+    items = p4.get('by_severity',{}).get(sev,[])
+    if not items: continue
+    e = sev_emoji.get(sev,'⚪')
+    md += f"\n### {e} {sev.upper()} — {len(items)} finding(s)\n\n"
+    for v in items[:20]:
+        cve_str = f" `{v.get('cve')}`" if v.get('cve') else ""
+        md += f"#### {v.get('name','unknown')}{cve_str}\n"
+        md += f"- **Host:** `{v.get('url', v.get('host',''))}`\n"
+        if v.get('cvss_score'):
+            md += f"- **CVSS:** {v['cvss_score']}\n"
+        if v.get('description'):
+            md += f"- **Descrição:** {v['description'][:250]}\n"
+        if v.get('extracted'):
+            md += f"- **Extraído:** `{str(v['extracted'])[:200]}`\n"
+        md += "\n"
+
+# GitHub Leaks
+if github_items:
+    md += f"\n---\n\n## 🐙 GitHub Leaks — {len(github_items)} repositórios\n\n"
+    for item in github_items[:25]:
+        md += f"- **[{item.get('repo','')}]({item.get('url','')})**\n"
+        md += f"  - Arquivo: `{item.get('file','')}`\n"
+        md += f"  - Query: `{item.get('query','')}`\n\n"
+
+# JS Secrets
+if js_findings:
+    md += f"\n---\n\n## 🔑 Secrets em JavaScript — {len(js_findings)} achados\n\n"
+    for f in js_findings[:20]:
+        e = sev_emoji.get(f.get('severity','medium'),'⚪')
+        md += f"- {e} **{f.get('type','')}** — `{f.get('url','')}`\n"
+        if f.get('matches'):
+            md += f"  - Sample: `{str(f['matches'][0])[:120]}`\n\n"
+
+# Dirs
+if dirs_found:
+    md += f"\n---\n\n## 📂 Diretórios Descobertos (ffuf) — {len(dirs_found)} paths\n\n"
+    for d in dirs_found[:30]:
+        md += f"- `[{d.get('status','')}]` {d.get('url','')}\n"
+
+# API Endpoints
+if api_eps:
+    md += f"\n---\n\n## 🔗 API Endpoints ({len(api_eps)})\n\n"
+    for ep in api_eps[:30]: md += f"- `{ep}`\n"
+
+# Juicy URLs
+if juicy:
+    md += f"\n---\n\n## 📁 URLs Sensíveis — Wayback/GAU ({len(juicy)})\n\n"
+    for u in juicy[:25]: md += f"- `{u}`\n"
+
+# Dorks
+if dork_cats:
+    md += f"\n---\n\n## 🎣 Google Dorks Gerados\n\n"
+    for cat, count in dork_cats.items():
+        md += f"- **{cat.replace('_',' ').title()}**: {count} dorks\n"
+    all_dorks = p2.get('dorks',{}).get('dorks',[])
+    if all_dorks:
+        md += "\n<details><summary>📋 Ver todos os dorks</summary>\n\n```\n"
+        md += "\n".join(all_dorks)
+        md += "\n```\n</details>\n"
+
+# Shodan CVEs
+if shodan_cves:
+    md += f"\n---\n\n## 💀 CVEs Expostos via Shodan\n\n"
+    for cve in shodan_cves[:20]: md += f"- [`{cve}`](https://nvd.nist.gov/vuln/detail/{cve})\n"
+
+# Email Security
+if email_sec:
+    md += f"\n---\n\n## 📧 Segurança de Email (SPF/DMARC/DKIM)\n\n```\n{email_sec[:1500]}\n```\n"
+
+# Subdomains
+subs_list = p1.get('subdomains',[])
+if subs_list:
+    md += f"\n---\n\n## 🌐 Subdomínios Descobertos — {len(subs_list)} total\n\n"
+    md += "<details><summary>📋 Ver lista completa</summary>\n\n```\n"
+    md += "\n".join(subs_list[:200])
+    md += "\n```\n</details>\n"
+
+md += f"""
+---
+
+## 📎 Artifacts Disponíveis para Download
+
+| Artifact | Conteúdo |
+|:---|:---|
+| `🚀-FINAL-REPORT-{DOMAIN}` | Este relatório + ai_analysis.json |
+| `phase5-normalized` | normalized-findings.json (todos os dados) |
+| `phase4-vuln` | Raw Nuclei output por severidade |
+| `phase2-osint` | Dorks + GitHub findings + Shodan |
+| `phase1-wayback` | URLs, params, juicy files (Wayback/GAU) |
+
+---
+
+*🤖 Relatório gerado por OSINT Recon Framework v2.0 — Gemini {MODEL}*
+*Scan ID: `{SCAN_ID}` — {ts}*
+"""
+
+with open('output/report/RECON-REPORT.md','w') as f:
+    f.write(md)
+
+with open('output/report/ai_analysis.json','w') as f:
+    json.dump({
+        'scan_id':       SCAN_ID,
+        'domain':        DOMAIN,
+        'timestamp':     ts,
+        'model':         MODEL,
+        'exec_summary':  exec_summary,
+        'attack_chains': attack_chains,
+        'threat_intel':  threat_intel,
+        'summary':       summary,
+    }, f, indent=2, ensure_ascii=False)
+
+print(f"""
+╔══════════════════════════════════════════════════╗
+║  ✅  RELATÓRIO GERADO COM SUCESSO                ║
+║  📄  RECON-REPORT.md  ({len(md)//1024} KB)              ║
+║  🤖  ai_analysis.json                            ║
+╚══════════════════════════════════════════════════╝
+""")
+PYEOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 🚀-FINAL-REPORT-${{ needs.setup.outputs.domain }}
+          path: output/report/
+          retention-days: 30
+
+      - name: Job Summary
         env:
           DOMAIN: ${{ needs.setup.outputs.domain }}
-          STEALTH_LEVEL: ${{ github.event.inputs.stealth_level }}
-          MAX_RATE: ${{ needs.setup.outputs.max_rate }}
-          SCAN_ID: ${{ github.run_id }}
         run: |
-          mkdir -p stealth-report
-          printf "# 🥷 STEALTH RECON REPORT\n**Target:** %s\n**Stealth:** %s\n**Max Rate:** %s req/s\n**Scan ID:** %s\n\n## 📊 SUMMARY\n" \
-            "$DOMAIN" "$STEALTH_LEVEL" "$MAX_RATE" "$SCAN_ID" > stealth-report/STEALTH-RECON.md
-          
-          SUBS=$(cat results/subdomains.txt 2>/dev/null | wc -l 2>/dev/null || echo 0)
-          LIVE=$(cat results/live.json 2>/dev/null | wc -l 2>/dev/null || echo 0)
-          VULN=$(cat results/nuclei.jsonl 2>/dev/null | wc -l 2>/dev/null || echo 0)
-          
-          cat >> stealth-report/STEALTH-RECON.md << TABLE_EOF
-          | Metric | Count |
-          | :--- | :--- |
-          | 🌐 Subdomains Found | $SUBS |
-          | 🟢 Live Hosts | $LIVE |
-          | 🚨 Vulnerabilities | $VULN |
-          TABLE_EOF
-
-      - name: Upload Final Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: Final-Stealth-Report
-          path: stealth-report/
+          echo "## 🥷 Recon Concluído — \`$DOMAIN\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          python3 -c "
+import json
+with open('output/report/ai_analysis.json') as f: d = json.load(f)
+s = d.get('summary',{})
+rows = [
+    ('🌐 Subdomains',  s.get('subdomains_total',0)),
+    ('🟢 Live Hosts',  s.get('live_hosts',0)),
+    ('🔴 Critical',    s.get('vulns_critical',0)),
+    ('🟠 High',        s.get('vulns_high',0)),
+    ('🟡 Medium',      s.get('vulns_medium',0)),
+    ('🐙 GitHub Leaks',s.get('github_leaks',0)),
+    ('🔑 JS Secrets',  s.get('js_secrets',0)),
+    ('💀 CVEs (Shodan)',s.get('exposed_cves',0)),
+]
+print('| Métrica | Total |')
+print('|:---|:---|')
+for k,v in rows: print(f'| {k} | **{v}** |')
+" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📥 **Relatório completo:** Actions → Artifacts → \`🚀-FINAL-REPORT-\$DOMAIN\`" >> $GITHUB_STEP_SUMMARY
