@@ -1,0 +1,74 @@
+id: custom-admin-panels
+
+info:
+  name: Admin Panel Discovery
+  author: OSINT Recon Pipeline
+  severity: medium
+  description: Detecta paineis administrativos expostos.
+  tags: panel,admin,login,dashboard
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/admin"
+      - "{{BaseURL}}/admin/"
+      - "{{BaseURL}}/administrator"
+      - "{{BaseURL}}/admin/login"
+      - "{{BaseURL}}/admin/dashboard"
+      - "{{BaseURL}}/wp-admin"
+      - "{{BaseURL}}/wp-login.php"
+      - "{{BaseURL}}/cpanel"
+      - "{{BaseURL}}/webmail"
+      - "{{BaseURL}}/admin.php"
+      - "{{BaseURL}}/manager"
+      - "{{BaseURL}}/management"
+      - "{{BaseURL}}/login"
+      - "{{BaseURL}}/signin"
+      - "{{BaseURL}}/dashboard"
+      - "{{BaseURL}}/portal"
+      - "{{BaseURL}}/console"
+      - "{{BaseURL}}/backend"
+      - "{{BaseURL}}/backoffice"
+      - "{{BaseURL}}/adminer"
+      - "{{BaseURL}}/adminer.php"
+      - "{{BaseURL}}/phpmyadmin"
+      - "{{BaseURL}}/phpMyAdmin"
+      - "{{BaseURL}}/pma"
+      - "{{BaseURL}}/dbadmin"
+      - "{{BaseURL}}/jenkins"
+      - "{{BaseURL}}/grafana"
+      - "{{BaseURL}}/kibana"
+      - "{{BaseURL}}/prometheus"
+      - "{{BaseURL}}/actuator"
+      - "{{BaseURL}}/actuator/env"
+      - "{{BaseURL}}/actuator/health"
+      - "{{BaseURL}}/actuator/mappings"
+      - "{{BaseURL}}/_cat/indices"
+      - "{{BaseURL}}/_cluster/health"
+
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+          - 301
+          - 302
+          - 401
+          - 403
+      - type: word
+        condition: or
+        case-insensitive: true
+        words:
+          - "admin"
+          - "login"
+          - "dashboard"
+          - "sign in"
+          - "username"
+          - "password"
+          - "authentication"
+          - "control panel"
+          - "management"
+    extractors:
+      - type: regex
+        regex:
+          - "<title>([^<]+)</title>"
