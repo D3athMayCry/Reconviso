@@ -1,0 +1,49 @@
+id: custom-info-disclosure
+
+info:
+  name: Information Disclosure Detection
+  author: OSINT Recon Pipeline
+  severity: low
+  description: Detecta vazamento de informacoes tecnicas.
+  tags: disclosure,info,debug
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/phpinfo.php"
+      - "{{BaseURL}}/info.php"
+      - "{{BaseURL}}/test.php"
+      - "{{BaseURL}}/server-status"
+      - "{{BaseURL}}/server-info"
+      - "{{BaseURL}}/status"
+      - "{{BaseURL}}/.well-known/security.txt"
+      - "{{BaseURL}}/robots.txt"
+      - "{{BaseURL}}/sitemap.xml"
+      - "{{BaseURL}}/crossdomain.xml"
+      - "{{BaseURL}}/clientaccesspolicy.xml"
+
+    matchers-condition: or
+    matchers:
+      - type: word
+        condition: or
+        words:
+          - "PHP Version"
+          - "phpinfo()"
+          - "Apache Server Status"
+          - "Server Information"
+      - type: word
+        condition: or
+        words:
+          - "Disallow:"
+          - "<urlset"
+    extractors:
+      - type: regex
+        name: php_version
+        group: 1
+        regex:
+          - "PHP Version ([0-9.]+)"
+      - type: regex
+        name: email
+        group: 1
+        regex:
+          - "([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})"
